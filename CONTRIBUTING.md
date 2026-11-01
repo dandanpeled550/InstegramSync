@@ -23,6 +23,13 @@ for humans.
    to production and tags the release.
 7. Hotfix: `hotfix/<slug>` from `main` → PR to `main` → then PR `main → dev` (back-merge).
 
+## Checks
+
+PRs run `ci/lint`, `ci/typecheck`, `ci/test` and `ci/secrets`; PRs into `main` also run `ci/source-branch`.
+`security-gate` decides whether `agent-review/security` is needed (the `security` label or a trust-boundary
+path such as `.github/**`, `scripts/**` or `supabase/**`). Fork PRs get a read-only token, so the gate status
+cannot be posted and they stay blocked (fail-closed); maintainers re-open them from a branch in this repo.
+
 ## Never
 
 - Commit or push directly to `dev` or `main`.

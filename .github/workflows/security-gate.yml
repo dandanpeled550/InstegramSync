@@ -1,0 +1,125 @@
+# security-gate: makes "agent-review/security is required when it applies" enforceable.
+#
+# A ruleset can only require a status unconditionally, so the ruleset always requires
+# `agent-review/security`, and this workflow decides whether it is needed:
+#   * required     -> posts `pending` (no verdict yet); security-reviewer later posts success/failure.
+#   * not required -> posts `success` with the description "not required".
+# Required when the PR has the `security` label OR its diff touches a trust-boundary path (list below).
+# On a path match the workflow also adds the `security` label, but the decision never relies on the label
+# alone: removing the label cannot turn a path-matched PR into "not required".
+#
+# It never overwrites a verdict. It only posts when the newest `agent-review/security` status on the head SHA
+# is absent or was posted by this workflow (creator github-actions[bot] AND the exact description strings
+# below). A failure/error, or a success from anyone else, is left alone. Statuses are re-read right before
+# posting to narrow the race window.
+#
+# KNOWN LIMITATIONS
+#  * With the `pull_request` trigger the workflow file that runs is the one on the PR's head branch, so a PR
+#    can edit this file and pass its own gate. Mitigations: `.github/**` is a trust-boundary path (such a PR
+#    still needs security review), and scripts/setup-branch-protection.sh pins this workflow with a ruleset
+#    "require workflows" rule from `dev` when the repo's plan supports it.
+#  * Fork PRs get a read-only token, so the status cannot be posted and the PR stays blocked (fail-closed).
+#  * Agents share one gh identity, so they could forge agent-review/* statuses (open question Q2 in M0.md).
+#
+# Trigger is `pull_request` only: never pull_request_target. No secrets are used.
+name: security-gate
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
+
+permissions:
+  statuses: write
+  pull-requests: write
+  contents: read
+
+concurrency:
+  group: security-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: security-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const CONTEXT = 'agent-review/security';
+            const OWN_LOGIN = 'github-actions[bot]';
+            const DESC_REQUIRED = 'security review required: awaiting agent-review/security verdict';
+            const DESC_NOT_REQUIRED = 'not required';
+
+            // Trust-boundary paths. Directory prefixes end with '/'; the rest are exact paths.
+            const DIR_PREFIXES = [
+              'supabase/functions/', 'supabase/migrations/', 'backend/app/api/', 'backend/app/db/',
+              '.github/', 'scripts/', 'fixtures/', '.claude/',
+            ];
+            const EXACT = new Set([
+              'supabase/config.toml', 'backend/app/serve.py', 'backend/app/config.py', '.env.example',
+              '.gitignore', '.pre-commit-config.yaml', 'Makefile', 'backend/pyproject.toml',
+              'frontend/package.json',
+            ]);
+            const LOCKFILE = /(^|\/)(uv\.lock|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|poetry\.lock|Pipfile\.lock|deno\.lock|bun\.lockb?|npm-shrinkwrap\.json|requirements[^/]*\.txt)$/;
+            const isBoundary = (p) =>
+              EXACT.has(p) || DIR_PREFIXES.some((d) => p.startsWith(d)) || LOCKFILE.test(p);
+
+            const { owner, repo } = context.repo;
+            const number = context.payload.pull_request.number;
+
+            // Read live state from the API, not from the event payload.
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+            const sha = pr.head.sha;
+            const labels = pr.labels.map((l) => l.name);
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: number, per_page: 100,
+            });
+            const touched = files.flatMap((f) => [f.filename, f.previous_filename].filter(Boolean));
+            const matched = touched.filter(isBoundary);
+            const required = labels.includes('security') || matched.length > 0;
+            core.info(`head=${sha} labels=[${labels}] boundaryFiles=${matched.length} required=${required}`);
+
+            if (matched.length > 0 && !labels.includes('security')) {
+              try {
+                await github.rest.issues.addLabels({ owner, repo, issue_number: number, labels: ['security'] });
+              } catch (e) {
+                core.warning(`could not add the security label: ${e.message}`);
+              }
+            }
+
+            const latest = async () => {
+              const list = await github.rest.repos.listCommitStatusesForRef({
+                owner, repo, ref: sha, per_page: 100,
+              });
+              return list.data.find((s) => s.context === CONTEXT); // newest first
+            };
+            const isOwn = (s) =>
+              s.creator?.login === OWN_LOGIN &&
+              (s.description === DESC_REQUIRED || s.description === DESC_NOT_REQUIRED);
+
+            const want = required
+              ? { state: 'pending', description: DESC_REQUIRED }
+              : { state: 'success', description: DESC_NOT_REQUIRED };
+
+            // Decide from the newest status; returns true when it is safe to post `want`.
+            const mayPost = (cur) => {
+              if (!cur) return true;
+              if (!isOwn(cur)) return false; // someone else's verdict (or pending): never touch
+              return !(cur.state === want.state && cur.description === want.description);
+            };
+
+            if (!mayPost(await latest())) {
+              core.info('Existing status is a verdict from someone else, or already correct: nothing to post.');
+              return;
+            }
+            // Re-read immediately before posting.
+            if (!mayPost(await latest())) {
+              core.info('Status changed while running: nothing to post.');
+              return;
+            }
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha, context: CONTEXT, state: want.state, description: want.description,
+              target_url: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+            });
+            core.info(`Posted ${CONTEXT}=${want.state} (${want.description})`);
