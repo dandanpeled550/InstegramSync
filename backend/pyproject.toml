@@ -1,0 +1,43 @@
+[project]
+name = "insta-saver-backend"
+version = "0.0.0"
+description = "Insta Saver worker and local API"
+requires-python = ">=3.12,<3.13"
+# No runtime dependencies yet: each one is added by devops-engineer after human approval.
+dependencies = []
+
+[dependency-groups]
+# Dev tools only (ruff, mypy, pytest are the approved tooling: .pre-commit-config.yaml, Makefile, ci).
+dev = [
+  "ruff",
+  "mypy",
+  "pytest",
+]
+
+[tool.uv]
+package = false
+default-groups = ["dev"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["app"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"../tests/**" = ["S101"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["app"]
+warn_unused_configs = true
+
+# pytest is run from the repo root: `scripts/run-pytest.sh` passes `-c backend/pyproject.toml --rootdir .`,
+# so these paths resolve against the repository root, not backend/.
+[tool.pytest.ini_options]
+pythonpath = ["backend"]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
