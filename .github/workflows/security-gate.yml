@@ -42,8 +42,11 @@ permissions:
   pull-requests: write
   contents: read
 
+# Statuses belong to a commit, so runs are serialized per head SHA (not per PR number): the last run for a SHA
+# sees every sibling PR. cancel-in-progress is safe because each run re-reads live state and a cancelled run's
+# successor always follows it.
 concurrency:
-  group: security-gate-${{ github.event.pull_request.number }}
+  group: security-gate-${{ github.event.pull_request.head.sha }}
   cancel-in-progress: true
 
 jobs:
@@ -96,45 +99,12 @@ jobs:
               return { pr: p, labels, matched, required };
             };
 
-            const mine = await assess(number);
-            const pr = mine.pr;
-            if (!BASES.includes(pr.base.ref)) {
-              core.info(`Base '${pr.base.ref}' is not dev/main: this gate does not apply, posting nothing.`);
-              return;
-            }
-            const sha = pr.head.sha;
+            const eventSha = context.payload.pull_request.head.sha;
 
-            if (mine.matched.length > 0 && !mine.labels.includes('security')) {
-              try {
-                await github.rest.issues.addLabels({ owner, repo, issue_number: number, labels: ['security'] });
-              } catch (e) {
-                core.warning(`could not add the security label: ${e.message}`);
-              }
-            }
-
-            // Statuses belong to the commit, not the PR. Every other open PR into dev/main that shares this head SHA
-            // must also be not-required before we may post `success`.
-            let required = mine.required;
-            if (!required) {
-              const assoc = await github.paginate(github.rest.repos.listPullRequestsAssociatedWithCommit, {
-                owner, repo, commit_sha: sha, per_page: 100,
-              });
-              for (const a of assoc) {
-                if (a.number === number || a.state !== 'open' || !BASES.includes(a.base.ref)) continue;
-                const other = await assess(a.number);
-                if (other.required) {
-                  core.info(`Sibling PR #${a.number} shares head ${sha} and requires security review: keeping the gate pending.`);
-                  required = true;
-                  break;
-                }
-              }
-            }
-            core.info(`final: head=${sha} required=${required}`);
-
-            // Newest agent-review/security status on the head SHA (the list is newest first). Fully paginated.
-            const latest = async () => {
+            // Newest agent-review/security status on a SHA (the list is newest first). Fully paginated.
+            const latestOn = async (ref) => {
               const list = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
-                owner, repo, ref: sha, per_page: 100,
+                owner, repo, ref, per_page: 100,
               });
               return list.find((s) => s.context === CONTEXT);
             };
@@ -142,28 +112,89 @@ jobs:
               s.creator?.login === OWN_LOGIN &&
               (s.description === DESC_REQUIRED || s.description === DESC_NOT_REQUIRED);
 
-            const want = required
-              ? { state: 'pending', description: DESC_REQUIRED }
-              : { state: 'success', description: DESC_NOT_REQUIRED };
+            const main = async () => {
+              const mine = await assess(number);
+              const pr = mine.pr;
+              if (!BASES.includes(pr.base.ref)) {
+                core.info(`Base '${pr.base.ref}' is not dev/main: this gate does not apply, posting nothing.`);
+                return;
+              }
+              const sha = pr.head.sha;
 
-            // Decide from the newest status; returns true when it is safe to post `want`.
-            const mayPost = (cur) => {
-              if (!cur) return true;
-              if (!isOwn(cur)) return false; // someone else's verdict (or pending): never touch
-              return !(cur.state === want.state && cur.description === want.description);
+              if (mine.matched.length > 0 && !mine.labels.includes('security')) {
+                try {
+                  await github.rest.issues.addLabels({ owner, repo, issue_number: number, labels: ['security'] });
+                } catch (e) {
+                  core.warning(`could not add the security label: ${e.message}`);
+                }
+              }
+
+              // Statuses belong to the commit, not the PR. Every other open PR into dev/main that shares this head SHA
+              // must also be not-required before we may post `success`. (Caveat: for a commit already on the default
+              // branch the API may list only merged PRs, so a release PR head never sees open siblings. Release PRs
+              // into main are merged by the human only.)
+              let required = mine.required;
+              if (!required) {
+                const assoc = await github.paginate(github.rest.repos.listPullRequestsAssociatedWithCommit, {
+                  owner, repo, commit_sha: sha, per_page: 100,
+                });
+                for (const a of assoc) {
+                  if (a.number === number || a.state !== 'open' || !BASES.includes(a.base.ref)) continue;
+                  const other = await assess(a.number);
+                  if (other.required) {
+                    core.info(`Sibling PR #${a.number} shares head ${sha} and requires security review: keeping the gate pending.`);
+                    required = true;
+                    break;
+                  }
+                }
+              }
+              core.info(`final: head=${sha} required=${required}`);
+
+              const want = required
+                ? { state: 'pending', description: DESC_REQUIRED }
+                : { state: 'success', description: DESC_NOT_REQUIRED };
+
+              // Decide from the newest status; returns true when it is safe to post `want`.
+              const mayPost = (cur) => {
+                if (!cur) return true;
+                if (!isOwn(cur)) return false; // someone else's verdict (or pending): never touch
+                return !(cur.state === want.state && cur.description === want.description);
+              };
+
+              if (!mayPost(await latestOn(sha))) {
+                core.info('Existing status is a verdict from someone else, or already correct: nothing to post.');
+                return;
+              }
+              // Re-read immediately before posting.
+              if (!mayPost(await latestOn(sha))) {
+                core.info('Status changed while running: nothing to post.');
+                return;
+              }
+              await github.rest.repos.createCommitStatus({
+                owner, repo, sha, context: CONTEXT, state: want.state, description: want.description,
+                target_url: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+              });
+              core.info(`Posted ${CONTEXT}=${want.state} (${want.description})`);
             };
 
-            if (!mayPost(await latest())) {
-              core.info('Existing status is a verdict from someone else, or already correct: nothing to post.');
-              return;
+            // Fail closed: if anything above throws (API error, rate limit) after this workflow previously posted
+            // its own `success: not required` on this SHA, that success would otherwise stay. Downgrade it to
+            // `pending`. A reviewer verdict (anything not posted by this workflow) is never touched.
+            try {
+              await main();
+            } catch (err) {
+              core.warning(`gate failed: ${err.message}`);
+              try {
+                const cur = await latestOn(eventSha);
+                if (cur && isOwn(cur) && cur.state === 'success') {
+                  await github.rest.repos.createCommitStatus({
+                    owner, repo, sha: eventSha, context: CONTEXT, state: 'pending', description: DESC_REQUIRED,
+                    target_url: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+                  });
+                  core.warning('posted pending (fail closed) after error');
+                }
+              } catch (err2) {
+                core.warning(`fail-closed fallback also failed: ${err2.message}`);
+              }
+              throw err;
             }
-            // Re-read immediately before posting.
-            if (!mayPost(await latest())) {
-              core.info('Status changed while running: nothing to post.');
-              return;
-            }
-            await github.rest.repos.createCommitStatus({
-              owner, repo, sha, context: CONTEXT, state: want.state, description: want.description,
-              target_url: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
-            });
-            core.info(`Posted ${CONTEXT}=${want.state} (${want.description})`);
