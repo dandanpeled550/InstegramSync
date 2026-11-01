@@ -1,6 +1,6 @@
 # 0003 — Git workflow, environments and backward-compatible migrations
 
-- Status: accepted
+- Status: accepted; decision 2 (merges) superseded by [0005](0005-merge-methods-with-back-merges.md)
 - Date: 2026-11-01
 - Deciders: product owner (AGENTS_PLAN.md §15); architect (proposed in PR #4) for the migration rules (5)
 
