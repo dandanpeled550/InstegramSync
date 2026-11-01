@@ -14,20 +14,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _common import block, git, git_toplevel, is_temp_path, project_dir, read_input, real  # noqa: E402
+from _common import (  # noqa: E402
+    SECRET_PATTERNS_COMPILED as COMPILED,
+    block,
+    git,
+    git_toplevel,
+    is_temp_path,
+    project_dir,
+    read_input,
+    real,
+)
 
-PATTERNS = [
-    ("Meta/Facebook access token", r"EAA[A-Za-z0-9]{30,}"),
-    ("Instagram access token", r"IG(?:AA|QV|QW)[A-Za-z0-9_\-]{30,}"),
-    ("Google API key", r"AIza[0-9A-Za-z_\-]{35}"),
-    ("Anthropic API key", r"sk-ant-[A-Za-z0-9_\-]{20,}"),
-    ("OpenAI-style secret key", r"sk-(?:proj-)?[A-Za-z0-9]{32,}"),
-    ("GitHub token", r"gh[pousr]_[A-Za-z0-9]{36,}"),
-    ("Supabase secret key", r"sb_secret_[A-Za-z0-9_\-]{20,}"),
-    ("Private key", r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-    ("JWT (e.g. Supabase service-role key)", r"eyJ[A-Za-z0-9_\-]{15,}\.eyJ[A-Za-z0-9_\-]{15,}\.[A-Za-z0-9_\-]{20,}"),
-]
-COMPILED = [(name, re.compile(rx)) for name, rx in PATTERNS]
 ENV_FILE = re.compile(r"^\.env(\..+)?$")
 
 

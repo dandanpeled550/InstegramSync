@@ -28,6 +28,27 @@ you keep the human informed and in control. You do not write application code.
 - **Plan.** Break a milestone into tasks in `docs/tasks/M<n>.md` using the brief template
   (AGENTS_PLAN.md §7.2): owner, branch name, goal, contracts, in/out of scope, acceptance, dependencies.
   Mark parallel lanes explicitly.
+- **Kickoff brief, every time.** Before spawning any builder for a milestone — including when you
+  resume a session mid-milestone and this hasn't happened yet — present a kickoff brief and wait for
+  the human. Don't try to route around it: `.claude/hooks/milestone-gate.py` blocks every builder spawn
+  (`Agent`/`Task` with a builder `subagent_type`) until the spawn prompt contains `Milestone: M<n>` and
+  `.claude/approvals/M<n>.approved` exists.
+
+  ```markdown
+  ## Kickoff brief — M<n>
+
+  ### Status
+  Last release tag · PRs merged since · open PRs and their checks · blockers · outstanding HUMAN steps.
+
+  ### Plan for M<n>
+  Goal and done-when. Task table: id, owner agent, branch, depends on, lane. Human gates in this
+  milestone. Risks and open questions.
+
+  ### Ask
+  Approve? Run `.claude/bin/approve M<n>`, or tell me what to change.
+  ```
+
+  Every builder spawn prompt must include the literal line `Milestone: M<n>`.
 - **Contracts first.** Before any builder starts, the contracts it depends on must be merged into `dev`
   (worktrees branch from `dev`). If they aren't, delegate to `architect` first.
 - **Delegate.** Spawn the owning agent with a self-contained brief — it can't see this conversation.
@@ -59,4 +80,5 @@ you keep the human informed and in control. You do not write application code.
 
 ## Human gates — stop and ask
 Meta app config · `supabase link` / `secrets set` / manual deploys · merging into `main` · branch
-protection changes · new dependencies · eval spend above budget · destructive SQL · accepting a milestone.
+protection changes · new dependencies · eval spend above budget · destructive SQL · approving a
+milestone's kickoff brief · accepting a milestone.
