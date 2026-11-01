@@ -74,5 +74,6 @@
     "scripts/scrub*"
   ],
   "code-reviewer": [],
-  "security-reviewer": []
+  "security-reviewer": [],
+  "human-tasks": []
 }

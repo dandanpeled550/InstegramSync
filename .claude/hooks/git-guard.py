@@ -5,7 +5,7 @@ Everyone:   no force push (--force-with-lease is fine), no --no-verify, no delet
 Agents:     no commit/merge/rebase/reset --hard on dev/main, no push to dev/main, no branch surgery on
             dev/main, no disabling git hooks, no reading .env files through the shell.
 gh:         only tech-lead merges PRs, only with --squash, never into main, never with --admin.
-Read-only agents (researcher, reviewers) may only run git/gh and a few read-only utilities.
+Read-only agents (researcher, reviewers, human-tasks) may only run git/gh and a few read-only utilities.
 
 Best effort: it parses the command text. GitHub branch protection is the backstop.
 """
@@ -17,27 +17,70 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _common import PROTECTED_BRANCHES, block, current_branch, project_dir, read_input  # noqa: E402
+from _common import PROTECTED_BRANCHES, block, current_branch, project_dir, read_input
 
 RESTRICTED_SHELL = {
     "researcher": {"git", "gh", "cd"},
-    "code-reviewer": {"git", "gh", "cd", "head", "tail", "wc", "grep", "sort", "uniq", "jq", "ls"},
-    "security-reviewer": {"git", "gh", "cd", "head", "tail", "wc", "grep", "sort", "uniq", "jq", "ls"},
+    "code-reviewer": {
+        "git",
+        "gh",
+        "cd",
+        "head",
+        "tail",
+        "wc",
+        "grep",
+        "sort",
+        "uniq",
+        "jq",
+        "ls",
+    },
+    "security-reviewer": {
+        "git",
+        "gh",
+        "cd",
+        "head",
+        "tail",
+        "wc",
+        "grep",
+        "sort",
+        "uniq",
+        "jq",
+        "ls",
+    },
+    "human-tasks": {
+        "git",
+        "gh",
+        "cd",
+        "head",
+        "tail",
+        "wc",
+        "grep",
+        "sort",
+        "uniq",
+        "jq",
+        "ls",
+    },
 }
 SHELLS = {"bash", "sh", "zsh"}
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 ENV_TOKEN = re.compile(r"(^|/)\.env(\.[A-Za-z0-9_-]+)?$")
 APPROVAL_PATHS = (".claude/approvals", ".claude/bin/approve")
-GIT_GLOBAL_WITH_ARG = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+GIT_GLOBAL_WITH_ARG = {
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--exec-path",
+}
 PUSH_OPTS_WITH_ARG = {"--repo", "-o", "--push-option", "--receive-pack", "--exec"}
 COMMIT_LIKE = {"commit", "merge", "rebase", "cherry-pick", "revert", "am"}
 
 
-def tokenize(cmd: str) -> List[List[str]]:
+def tokenize(cmd: str) -> list[list[str]]:
     """Split a shell command into segments of tokens, respecting quotes."""
     try:
         lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|")
@@ -46,7 +89,7 @@ def tokenize(cmd: str) -> List[List[str]]:
         tokens = list(lex)
     except ValueError:
         tokens = cmd.split()
-    segments: List[List[str]] = [[]]
+    segments: list[list[str]] = [[]]
     for tok in tokens:
         if tok and set(tok) <= set(";&|"):
             segments.append([])
@@ -55,20 +98,22 @@ def tokenize(cmd: str) -> List[List[str]]:
     return [s for s in segments if s]
 
 
-def program_index(seg: List[str]) -> int:
+def program_index(seg: list[str]) -> int:
     i = 0
-    while i < len(seg) and (ASSIGNMENT.match(seg[i]) or seg[i] in {"env", "command", "time", "nohup"}):
+    while i < len(seg) and (
+        ASSIGNMENT.match(seg[i]) or seg[i] in {"env", "command", "time", "nohup"}
+    ):
         i += 1
     return i
 
 
 def strip_ref(ref: str) -> str:
     ref = ref.lstrip("+")
-    return ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+    return ref.removeprefix("refs/heads/")
 
 
 class Guard:
-    def __init__(self, agent: Optional[str], cwd: Path) -> None:
+    def __init__(self, agent: str | None, cwd: Path) -> None:
         self.agent = agent
         self.cwd = cwd
 
@@ -79,16 +124,20 @@ class Guard:
         for seg in tokenize(cmd):
             self.check_segment(seg, depth)
 
-    def check_segment(self, seg: List[str], depth: int) -> None:
+    def check_segment(self, seg: list[str], depth: int) -> None:
         start = program_index(seg)
         if start >= len(seg):
             return
         prog = Path(seg[start]).name
 
         if self.agent in RESTRICTED_SHELL and prog not in RESTRICTED_SHELL[self.agent]:
-            self.deny(f"{self.agent} may only run: {', '.join(sorted(RESTRICTED_SHELL[self.agent]))} (got '{prog}').")
+            self.deny(
+                f"{self.agent} may only run: {', '.join(sorted(RESTRICTED_SHELL[self.agent]))} (got '{prog}')."
+            )
 
-        if self.agent and any(ENV_TOKEN.search(t) and not t.endswith(".env.example") for t in seg):
+        if self.agent and any(
+            ENV_TOKEN.search(t) and not t.endswith(".env.example") for t in seg
+        ):
             self.deny("agents never read or source .env files through the shell.")
 
         if self.agent and any(p in t for t in seg for p in APPROVAL_PATHS):
@@ -122,7 +171,7 @@ class Guard:
             i += 1
 
     # ---- git -----------------------------------------------------------------------------
-    def check_git(self, args: List[str]) -> None:
+    def check_git(self, args: list[str]) -> None:
         where = self.cwd
         i = 1
         while i < len(args) and args[i].startswith("-"):
@@ -131,10 +180,14 @@ class Guard:
             i += 2 if args[i] in GIT_GLOBAL_WITH_ARG else 1
         if i >= len(args):
             return
-        sub, rest = args[i], args[i + 1:]
+        sub, rest = args[i], args[i + 1 :]
         branch = current_branch(where)
 
-        if sub == "commit" and any(re.fullmatch(r"-[a-zA-Z]*n[a-zA-Z]*", a) for a in rest if not a.startswith("--")):
+        if sub == "commit" and any(
+            re.fullmatch(r"-[a-zA-Z]*n[a-zA-Z]*", a)
+            for a in rest
+            if not a.startswith("--")
+        ):
             self.deny("`git commit -n` skips the safety hooks.")
 
         if sub == "push":
@@ -144,25 +197,49 @@ class Guard:
             return
 
         if sub in COMMIT_LIKE and branch in PROTECTED_BRANCHES:
-            self.deny(f"agents never `git {sub}` on '{branch}'. Create a branch from origin/dev first.")
+            self.deny(
+                f"agents never `git {sub}` on '{branch}'. Create a branch from origin/dev first."
+            )
         if sub == "pull" and branch in PROTECTED_BRANCHES and "--ff-only" not in rest:
             self.deny(f"on '{branch}' only `git pull --ff-only` is allowed.")
         if sub == "reset" and "--hard" in rest and branch in PROTECTED_BRANCHES:
             self.deny(f"agents never `git reset --hard` on '{branch}'.")
-        if sub == "branch" and set(rest) & {"-D", "-d", "--delete", "-m", "-M", "--move", "-f", "--force"}:
-            if set(map(strip_ref, rest)) & PROTECTED_BRANCHES:
-                self.deny("agents never delete, move or force-reset dev/main.")
-        if sub in {"checkout", "switch"} and set(rest) & {"-B", "-C", "--force-create"}:
-            if set(rest) & PROTECTED_BRANCHES:
-                self.deny("agents never recreate dev/main.")
-        if sub == "update-ref" and any(strip_ref(a) in PROTECTED_BRANCHES for a in rest):
+        if (
+            sub == "branch"
+            and set(rest)
+            & {
+                "-D",
+                "-d",
+                "--delete",
+                "-m",
+                "-M",
+                "--move",
+                "-f",
+                "--force",
+            }
+            and set(map(strip_ref, rest)) & PROTECTED_BRANCHES
+        ):
+            self.deny("agents never delete, move or force-reset dev/main.")
+        if (
+            sub in {"checkout", "switch"}
+            and set(rest) & {"-B", "-C", "--force-create"}
+            and set(rest) & PROTECTED_BRANCHES
+        ):
+            self.deny("agents never recreate dev/main.")
+        if sub == "update-ref" and any(
+            strip_ref(a) in PROTECTED_BRANCHES for a in rest
+        ):
             self.deny("agents never move dev/main with update-ref.")
-        if sub == "config" and any("hookspath" in a.lower() for a in rest) and "--get" not in rest:
+        if (
+            sub == "config"
+            and any("hookspath" in a.lower() for a in rest)
+            and "--get" not in rest
+        ):
             self.deny("agents never change core.hooksPath.")
 
-    def check_push(self, rest: List[str], branch: Optional[str]) -> None:
-        positional: List[str] = []
-        flags: List[str] = []
+    def check_push(self, rest: list[str], branch: str | None) -> None:
+        positional: list[str] = []
+        flags: list[str] = []
         i = 0
         while i < len(rest):
             a = rest[i]
@@ -172,11 +249,15 @@ class Guard:
             (flags if a.startswith("-") else positional).append(a)
             i += 1
 
-        force = {"--force", "-f", "--mirror"} & set(flags) or any(
-            re.fullmatch(r"-[a-zA-Z]*f[a-zA-Z]*", f) for f in flags
-        ) or any(p.startswith("+") for p in positional[1:])
+        force = (
+            {"--force", "-f", "--mirror"} & set(flags)
+            or any(re.fullmatch(r"-[a-zA-Z]*f[a-zA-Z]*", f) for f in flags)
+            or any(p.startswith("+") for p in positional[1:])
+        )
         if force:
-            self.deny("force pushes are not allowed; use --force-with-lease on your own feature branch.")
+            self.deny(
+                "force pushes are not allowed; use --force-with-lease on your own feature branch."
+            )
 
         refspecs = positional[1:]
         deleting = bool({"--delete", "-d"} & set(flags))
@@ -200,15 +281,21 @@ class Guard:
             targets.add(branch)
         hit = targets & PROTECTED_BRANCHES
         if hit:
-            self.deny(f"agents never push to {', '.join(sorted(hit))}. Push your feature branch and open a PR.")
+            self.deny(
+                f"agents never push to {', '.join(sorted(hit))}. Push your feature branch and open a PR."
+            )
 
     # ---- gh ------------------------------------------------------------------------------
-    def check_gh(self, args: List[str]) -> None:
+    def check_gh(self, args: list[str]) -> None:
         if not self.agent or len(args) < 3:
             return
         group, action, rest = args[1], args[2], args[3:]
 
-        if group == "secret" or group == "variable" or (group == "repo" and action in {"delete", "edit", "rename", "archive"}):
+        if (
+            group == "secret"
+            or group == "variable"
+            or (group == "repo" and action in {"delete", "edit", "rename", "archive"})
+        ):
             self.deny(f"`gh {group} {action}` is a human gate.")
         if group != "pr" or action != "merge":
             return
@@ -217,7 +304,9 @@ class Guard:
         if "--admin" in rest:
             self.deny("--admin bypasses branch protection.")
         if "--squash" not in rest and "-s" not in rest:
-            self.deny("feature PRs are squash-merged into dev: use `gh pr merge <n> --squash --delete-branch`.")
+            self.deny(
+                "feature PRs are squash-merged into dev: use `gh pr merge <n> --squash --delete-branch`."
+            )
         pr = next((a for a in rest if not a.startswith("-")), None)
         base = self.pr_base(pr)
         if base is None:
@@ -225,11 +314,27 @@ class Guard:
         if base == "main":
             self.deny("only the human merges into main.")
 
-    def pr_base(self, pr: Optional[str]) -> Optional[str]:
-        cmd = ["gh", "pr", "view", *([pr] if pr else []), "--json", "baseRefName", "-q", ".baseRefName"]
+    def pr_base(self, pr: str | None) -> str | None:
+        cmd = [
+            "gh",
+            "pr",
+            "view",
+            *([pr] if pr else []),
+            "--json",
+            "baseRefName",
+            "-q",
+            ".baseRefName",
+        ]
         try:
-            r = subprocess.run(cmd, cwd=str(self.cwd), capture_output=True, text=True, timeout=20)
-        except Exception:
+            r = subprocess.run(
+                cmd,
+                check=False,
+                cwd=str(self.cwd),
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except Exception:  # noqa: BLE001 — best effort, see module docstring
             return None
         if r.returncode != 0:
             return None

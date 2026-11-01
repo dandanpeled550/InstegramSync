@@ -19,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 import pytest
 
@@ -32,7 +32,9 @@ SCRATCH_BASE = TESTS_DIR / ".tmp"
 
 
 def git(args, cwd: Path) -> None:
-    subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True
+    )
 
 
 @pytest.fixture
@@ -59,22 +61,23 @@ def hook_repo():
 def run_hook(
     repo: Path,
     hook_name: str,
-    data: Dict[str, Any],
-    cwd: Optional[Path] = None,
-    raw_stdin: Optional[str] = None,
+    data: dict[str, Any],
+    cwd: Path | None = None,
+    raw_stdin: str | None = None,
 ) -> subprocess.CompletedProcess:
     hook_path = repo / ".claude" / "hooks" / hook_name
     return subprocess.run(
         [sys.executable, str(hook_path)],
         input=raw_stdin if raw_stdin is not None else json.dumps(data),
         cwd=str(cwd or repo),
+        check=False,
         capture_output=True,
         text=True,
         timeout=30,
     )
 
 
-def write_json(path: Path, data: Dict[str, Any]) -> None:
+def write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data))
 
@@ -96,7 +99,11 @@ def test_ownership_allows_agent_in_its_own_glob(hook_repo: Path) -> None:
     r = run_hook(
         hook_repo,
         "enforce-ownership.py",
-        {"agent_type": "alpha-engineer", "cwd": str(hook_repo), "tool_input": {"file_path": "alpha/x.py"}},
+        {
+            "agent_type": "alpha-engineer",
+            "cwd": str(hook_repo),
+            "tool_input": {"file_path": "alpha/x.py"},
+        },
     )
     assert r.returncode == 0, r.stderr
 
@@ -106,7 +113,11 @@ def test_ownership_blocks_agent_outside_its_glob(hook_repo: Path) -> None:
     r = run_hook(
         hook_repo,
         "enforce-ownership.py",
-        {"agent_type": "alpha-engineer", "cwd": str(hook_repo), "tool_input": {"file_path": "beta/x.py"}},
+        {
+            "agent_type": "alpha-engineer",
+            "cwd": str(hook_repo),
+            "tool_input": {"file_path": "beta/x.py"},
+        },
     )
     assert r.returncode == 2
     assert "beta-engineer" in r.stderr
@@ -117,7 +128,11 @@ def test_ownership_blocks_unregistered_agent(hook_repo: Path) -> None:
     r = run_hook(
         hook_repo,
         "enforce-ownership.py",
-        {"agent_type": "ghost-engineer", "cwd": str(hook_repo), "tool_input": {"file_path": "alpha/x.py"}},
+        {
+            "agent_type": "ghost-engineer",
+            "cwd": str(hook_repo),
+            "tool_input": {"file_path": "alpha/x.py"},
+        },
     )
     assert r.returncode == 2
     assert "not registered" in r.stderr
@@ -147,7 +162,10 @@ def test_secret_scan_blocks_credential_looking_content(hook_repo: Path) -> None:
         {
             "agent_type": "devops-engineer",
             "cwd": str(hook_repo),
-            "tool_input": {"file_path": "config.py", "content": f"TOKEN = '{FAKE_TOKEN}'"},
+            "tool_input": {
+                "file_path": "config.py",
+                "content": f"TOKEN = '{FAKE_TOKEN}'",
+            },
         },
     )
     assert r.returncode == 2
@@ -194,14 +212,19 @@ def test_secret_scan_allows_env_example(hook_repo: Path) -> None:
     assert r.returncode == 0, r.stderr
 
 
-def test_secret_scan_allows_human_writing_secret_to_ignored_file(hook_repo: Path) -> None:
+def test_secret_scan_allows_human_writing_secret_to_ignored_file(
+    hook_repo: Path,
+) -> None:
     (hook_repo / ".gitignore").write_text("*.local\n")
     git(["add", "-A"], hook_repo)
     git(["commit", "-q", "-m", "gitignore"], hook_repo)
     r = run_hook(
         hook_repo,
         "secret-scan.py",
-        {"cwd": str(hook_repo), "tool_input": {"file_path": "secret.local", "content": FAKE_TOKEN}},
+        {
+            "cwd": str(hook_repo),
+            "tool_input": {"file_path": "secret.local", "content": FAKE_TOKEN},
+        },
     )
     assert r.returncode == 0, r.stderr
 
@@ -215,7 +238,11 @@ def test_git_guard_blocks_commit_on_main(hook_repo: Path) -> None:
     r = run_hook(
         hook_repo,
         "git-guard.py",
-        {"agent_type": "pipeline-engineer", "cwd": str(hook_repo), "tool_input": {"command": "git commit -am x"}},
+        {
+            "agent_type": "pipeline-engineer",
+            "cwd": str(hook_repo),
+            "tool_input": {"command": "git commit -am x"},
+        },
     )
     assert r.returncode == 2
     assert "main" in r.stderr
@@ -226,7 +253,11 @@ def test_git_guard_allows_commit_on_feature_branch(hook_repo: Path) -> None:
     r = run_hook(
         hook_repo,
         "git-guard.py",
-        {"agent_type": "pipeline-engineer", "cwd": str(hook_repo), "tool_input": {"command": "git commit -am x"}},
+        {
+            "agent_type": "pipeline-engineer",
+            "cwd": str(hook_repo),
+            "tool_input": {"command": "git commit -am x"},
+        },
     )
     assert r.returncode == 0, r.stderr
 
@@ -249,7 +280,10 @@ def test_git_guard_blocks_force_push_even_without_agent(hook_repo: Path) -> None
     r = run_hook(
         hook_repo,
         "git-guard.py",
-        {"cwd": str(hook_repo), "tool_input": {"command": "git push --force origin feat/x"}},
+        {
+            "cwd": str(hook_repo),
+            "tool_input": {"command": "git push --force origin feat/x"},
+        },
     )
     assert r.returncode == 2
     assert "force" in r.stderr
@@ -301,7 +335,10 @@ def test_git_guard_allows_human_running_approve(hook_repo: Path) -> None:
     r = run_hook(
         hook_repo,
         "git-guard.py",
-        {"cwd": str(hook_repo), "tool_input": {"command": ".claude/bin/approve M1 looks good"}},
+        {
+            "cwd": str(hook_repo),
+            "tool_input": {"command": ".claude/bin/approve M1 looks good"},
+        },
     )
     assert r.returncode == 0, r.stderr
 
@@ -310,10 +347,41 @@ def test_git_guard_restricts_researcher_shell(hook_repo: Path) -> None:
     r = run_hook(
         hook_repo,
         "git-guard.py",
-        {"agent_type": "researcher", "cwd": str(hook_repo), "tool_input": {"command": "rm -rf alpha/"}},
+        {
+            "agent_type": "researcher",
+            "cwd": str(hook_repo),
+            "tool_input": {"command": "rm -rf alpha/"},
+        },
     )
     assert r.returncode == 2
     assert "may only run" in r.stderr
+
+
+def test_git_guard_restricts_human_tasks_shell(hook_repo: Path) -> None:
+    r = run_hook(
+        hook_repo,
+        "git-guard.py",
+        {
+            "agent_type": "human-tasks",
+            "cwd": str(hook_repo),
+            "tool_input": {"command": "rm -rf alpha/"},
+        },
+    )
+    assert r.returncode == 2
+    assert "may only run" in r.stderr
+
+
+def test_git_guard_allows_human_tasks_readonly_commands(hook_repo: Path) -> None:
+    r = run_hook(
+        hook_repo,
+        "git-guard.py",
+        {
+            "agent_type": "human-tasks",
+            "cwd": str(hook_repo),
+            "tool_input": {"command": "gh pr list"},
+        },
+    )
+    assert r.returncode == 0, r.stderr
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -322,7 +390,10 @@ def test_git_guard_restricts_researcher_shell(hook_repo: Path) -> None:
 
 
 def test_quality_gate_passes_when_checks_pass(hook_repo: Path) -> None:
-    write_json(hook_repo / ".claude" / "gates.json", {"fake-agent": [{"name": "ok", "run": "true"}]})
+    write_json(
+        hook_repo / ".claude" / "gates.json",
+        {"fake-agent": [{"name": "ok", "run": "true"}]},
+    )
     r = run_hook(
         hook_repo,
         "quality-gate.py",
@@ -332,7 +403,10 @@ def test_quality_gate_passes_when_checks_pass(hook_repo: Path) -> None:
 
 
 def test_quality_gate_blocks_on_failing_check(hook_repo: Path) -> None:
-    write_json(hook_repo / ".claude" / "gates.json", {"fake-agent": [{"name": "boom", "run": "false"}]})
+    write_json(
+        hook_repo / ".claude" / "gates.json",
+        {"fake-agent": [{"name": "boom", "run": "false"}]},
+    )
     r = run_hook(
         hook_repo,
         "quality-gate.py",
@@ -340,11 +414,16 @@ def test_quality_gate_blocks_on_failing_check(hook_repo: Path) -> None:
     )
     assert r.returncode == 2
     assert "boom" in r.stderr
-    assert (hook_repo / ".claude" / "logs" / "gate-fake-agent-a2.count").read_text().strip() == "1"
+    assert (
+        hook_repo / ".claude" / "logs" / "gate-fake-agent-a2.count"
+    ).read_text().strip() == "1"
 
 
 def test_quality_gate_gives_up_after_max_blocks(hook_repo: Path) -> None:
-    write_json(hook_repo / ".claude" / "gates.json", {"fake-agent": [{"name": "boom", "run": "false"}]})
+    write_json(
+        hook_repo / ".claude" / "gates.json",
+        {"fake-agent": [{"name": "boom", "run": "false"}]},
+    )
     data = {"agent_type": "fake-agent", "agent_id": "a3", "cwd": str(hook_repo)}
     results = [run_hook(hook_repo, "quality-gate.py", data) for _ in range(4)]
     assert [r.returncode for r in results] == [2, 2, 2, 0]
@@ -353,7 +432,11 @@ def test_quality_gate_gives_up_after_max_blocks(hook_repo: Path) -> None:
 def test_quality_gate_skips_check_when_area_missing(hook_repo: Path) -> None:
     write_json(
         hook_repo / ".claude" / "gates.json",
-        {"fake-agent": [{"name": "skip me", "only_if_exists": ["nope"], "run": "false"}]},
+        {
+            "fake-agent": [
+                {"name": "skip me", "only_if_exists": ["nope"], "run": "false"}
+            ]
+        },
     )
     r = run_hook(
         hook_repo,
@@ -364,7 +447,10 @@ def test_quality_gate_skips_check_when_area_missing(hook_repo: Path) -> None:
 
 
 def test_quality_gate_noop_for_agent_without_checks(hook_repo: Path) -> None:
-    write_json(hook_repo / ".claude" / "gates.json", {"fake-agent": [{"name": "boom", "run": "false"}]})
+    write_json(
+        hook_repo / ".claude" / "gates.json",
+        {"fake-agent": [{"name": "boom", "run": "false"}]},
+    )
     r = run_hook(
         hook_repo,
         "quality-gate.py",
@@ -378,18 +464,24 @@ def test_quality_gate_noop_for_agent_without_checks(hook_repo: Path) -> None:
 # ---------------------------------------------------------------------------------------------------
 
 
-def spawn(subagent_type: str, prompt: str) -> Dict[str, Any]:
+def spawn(subagent_type: str, prompt: str) -> dict[str, Any]:
     return {"tool_input": {"subagent_type": subagent_type, "prompt": prompt}}
 
 
 def test_milestone_gate_blocks_builder_without_milestone_line(hook_repo: Path) -> None:
-    r = run_hook(hook_repo, "milestone-gate.py", spawn("pipeline-engineer", "Do the thing"))
+    r = run_hook(
+        hook_repo, "milestone-gate.py", spawn("pipeline-engineer", "Do the thing")
+    )
     assert r.returncode == 2
     assert "approve" in r.stderr
 
 
 def test_milestone_gate_blocks_builder_without_approval_file(hook_repo: Path) -> None:
-    r = run_hook(hook_repo, "milestone-gate.py", spawn("pipeline-engineer", "Milestone: M1\nDo the thing"))
+    r = run_hook(
+        hook_repo,
+        "milestone-gate.py",
+        spawn("pipeline-engineer", "Milestone: M1\nDo the thing"),
+    )
     assert r.returncode == 2
     assert "M1" in r.stderr
 
@@ -398,17 +490,25 @@ def test_milestone_gate_allows_builder_once_approved(hook_repo: Path) -> None:
     approvals = hook_repo / ".claude" / "approvals"
     approvals.mkdir(parents=True)
     (approvals / "M1.approved").write_text("approved_at=now\n")
-    r = run_hook(hook_repo, "milestone-gate.py", spawn("pipeline-engineer", "Milestone: M1\nDo the thing"))
+    r = run_hook(
+        hook_repo,
+        "milestone-gate.py",
+        spawn("pipeline-engineer", "Milestone: M1\nDo the thing"),
+    )
     assert r.returncode == 0, r.stderr
 
 
 def test_milestone_gate_never_gates_architect(hook_repo: Path) -> None:
-    r = run_hook(hook_repo, "milestone-gate.py", spawn("architect", "Write the contract"))
+    r = run_hook(
+        hook_repo, "milestone-gate.py", spawn("architect", "Write the contract")
+    )
     assert r.returncode == 0, r.stderr
 
 
 def test_milestone_gate_never_gates_reviewers(hook_repo: Path) -> None:
-    r = run_hook(hook_repo, "milestone-gate.py", spawn("code-reviewer", "Review this PR"))
+    r = run_hook(
+        hook_repo, "milestone-gate.py", spawn("code-reviewer", "Review this PR")
+    )
     assert r.returncode == 0, r.stderr
 
 
@@ -440,7 +540,9 @@ def test_agent_feed_writes_per_agent_and_all_log(hook_repo: Path) -> None:
     )
     assert r.returncode == 0, r.stderr
     all_log = read_all_log(hook_repo)
-    agent_log = (hook_repo / ".claude" / "logs" / "agents" / "pipeline-engineer.log").read_text()
+    agent_log = (
+        hook_repo / ".claude" / "logs" / "agents" / "pipeline-engineer.log"
+    ).read_text()
     for text in (all_log, agent_log):
         assert "pipeline-engineer Bash pytest -q tests/pipeline" in text
 
@@ -466,7 +568,11 @@ def test_agent_feed_skips_when_no_agent_type(hook_repo: Path) -> None:
     r = run_hook(
         hook_repo,
         "agent-feed.py",
-        {"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}},
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+        },
     )
     assert r.returncode == 0, r.stderr
     assert not (hook_repo / ".claude" / "logs" / "agents").exists()
@@ -489,7 +595,9 @@ def test_agent_feed_saves_redacted_handoff_on_subagent_stop(hook_repo: Path) -> 
         },
     )
     assert r.returncode == 0, r.stderr
-    handoffs = list((hook_repo / ".claude" / "logs" / "handoffs").glob("*-devops-engineer.md"))
+    handoffs = list(
+        (hook_repo / ".claude" / "logs" / "handoffs").glob("*-devops-engineer.md")
+    )
     assert len(handoffs) == 1
     body = handoffs[0].read_text()
     assert body.startswith("agent_transcript_path: /tmp/fake-transcript.jsonl")

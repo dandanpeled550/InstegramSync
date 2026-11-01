@@ -40,6 +40,7 @@ Every sub-agent writes a line per tool call to `.claude/logs/agents/<agent>.log`
 | Pane | Command | Shows |
 |---|---|---|
 | Main | `claude --agent tech-lead` | the orchestrator you're driving |
+| Split | `claude --agent human-tasks` | one page: exactly what needs *you* right now |
 | Split (`Cmd+D`) | `.claude/bin/agent-watch` | live status dashboard: one row per agent, redrawn in place |
 | Split (`Cmd+Shift+D`) | `.claude/bin/agent-watch prs` | open PRs + checks, refreshed every 30s |
 | Extra split per agent | `.claude/bin/agent-watch <agent>` | raw tail of one agent's log, e.g. `agent-watch pipeline-engineer` |
@@ -50,6 +51,12 @@ per agent (from `.claude/agents/*.md`), each showing its current status (`●` r
 top. For the old scrolling, color-per-agent tail across every agent, use `agent-watch log`.
 `.claude/bin/agent-watch handoffs` lists the 10 newest handoff reports and prints the latest in full —
 useful right after a builder finishes, before you decide what to review next.
+
+**`human-tasks` — a second session just for what's on you.** `tech-lead`'s own conversation is full of
+engineering detail; `human-tasks` is read-only and only reports pending approvals, unchecked `HUMAN H<n>`
+board items, blockers from recent handoffs, and PRs waiting on you (like a release PR to merge) — with
+the exact unblocking action for each. Re-ask it any time; it always re-reads current state, never a
+cached answer. It never does anything itself — if something needs action, it tells you to tell `tech-lead`.
 
 **Built-in agent panel.** Inside the `tech-lead` session itself, press `↑`/`↓` then `Enter` to open
 Claude Code's agent panel and inspect a running sub-agent directly, without leaving the pane.

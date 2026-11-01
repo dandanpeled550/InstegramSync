@@ -64,6 +64,7 @@ responsibilities, guidelines and guardrails — enforced by tooling, not only by
 | `test-engineer` | sonnet / medium | `tests/integration/**`, `tests/e2e/**`, `fixtures/**`, `scripts/replay*` | Read, Grep, Glob, Edit, Write, Bash | worktree | — |
 | `code-reviewer` | opus / high | nothing (read-only) | Read, Grep, Glob, Bash (git diff) | — | project |
 | `security-reviewer` | opus / high | nothing (read-only) | Read, Grep, Glob, Bash (git diff) | — | project |
+| `human-tasks` | sonnet / medium | nothing (read-only) | Read, Grep, Glob, Bash (git, gh) | — | project |
 
 **Unit tests belong to the builder** of each area (`tests/<area>/**` is in its ownership — e.g.
 `tests/pipeline/**` for `pipeline-engineer`), so code and its tests land in the same PR. `test-engineer`
@@ -236,6 +237,20 @@ fetch, cookie/session security, prompt injection paths (caption → model → st
 dependency additions.
 **Guardrails:** Read-only. Any `high` finding sets `agent-review/security: failure`, which blocks merge.
 Runs on every PR labeled `security` and on every release PR to `main`.
+
+### 4.13 `human-tasks` — human inbox
+**Role:** A second session the human runs alongside `tech-lead` (`claude --agent human-tasks`) to see
+exactly what needs them, without re-reading the orchestrator's conversation.
+**Reads:** `.claude/approvals/` vs. `docs/tasks/M*.md` (pending kickoff-brief approvals), unchecked
+`HUMAN H<n>` lines on the task boards, recent `.claude/logs/handoffs/*.md` (blockers, open questions,
+decisions addressed to the human — free text, read for meaning), `gh pr list` (release PRs and stalled
+checks), and `CLAUDE.md`'s human-gate list for context.
+**Output:** One short, de-duplicated, prioritized "what needs you" list with the unblocking action for
+each item, or a one-line "nothing needs you" if there's genuinely nothing.
+**Guardrails:** Read-only (no Edit/Write; the ownership hook blocks it anyway). Never acts on an item or
+spawns an agent — hands anything actionable back to `tech-lead`. Always re-derives status from a fresh
+read; project memory is only for standing human preferences about what to keep flagging, never for
+caching "what's pending."
 
 ---
 
