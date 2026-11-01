@@ -5,10 +5,10 @@ files, not through conversation.
 
 | File | Contents | Status |
 |---|---|---|
-| `schema.md` | Tables, columns, statuses, indexes (mirrors `supabase/migrations/`) | M0.1 |
-| `interfaces.md` | `Decider`, `VisionModel`, `Evidence`, `StageDecision`, `CascadeResult` | M0.1 |
-| `api.md` | Local REST API: endpoints, JSON shapes, errors | M0.1 (skeleton) |
-| `storage.md` | Storage bucket layout and lifecycle | M0.1 |
+| [`schema.md`](schema.md) | Tables, columns, statuses + transitions, indexes, RLS, migration rules (mirrors `supabase/migrations/`) | v0 (M0.1) |
+| [`interfaces.md`](interfaces.md) | `Post`, `Decider`, `VisionModel`, `Evidence`, `StageDecision`, `CascadeResult`, `Titler`, policy, `run_worker` | v0 (M0.1); repo/storage signatures before M3 |
+| [`api.md`](api.md) | Local REST API: endpoints, JSON shapes, errors | v0 (M0.1) |
+| [`storage.md`](storage.md) | Storage bucket, path layout, access, lifecycle | v0 (M0.1) |
 | `payloads.md` | Real (scrubbed) Instagram webhook payload shapes | M1 (after the spike) |
 
 Rules:
