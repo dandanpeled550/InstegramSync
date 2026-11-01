@@ -8,9 +8,12 @@
 # Needs: gh (logged in as a repo admin), jq. Override the target with REPO=owner/name.
 #
 # Rulesets (no bypass actors):
-#   protect-main: PR required, merge-commit only, required checks (incl. ci/source-branch), up to date,
-#                 no force push, no deletion.
-#   protect-dev : same but squash only and without ci/source-branch.
+#   protect-main: PR required, merge commit + squash allowed (squash is for hotfixes), required checks
+#                 (incl. ci/source-branch), branch must be up to date, no force push, no deletion.
+#   protect-dev : same but squash + merge commit allowed, and without ci/source-branch.
+# Merge methods (human decision 2026-11-01, option A): dev allows squash and merge commits. The merge commit on
+# dev exists ONLY for main -> dev back-merges; that is a tech-lead rule and cannot be enforced by a ruleset.
+# Feature PRs into dev are squash-merged by tech-lead.
 # `agent-review/security` is required unconditionally; .github/workflows/security-gate.yml posts
 # `success: not required` when the PR does not touch the trust boundary.
 # `ci/*` required checks are bound to GitHub Actions (integration_id 15368) so no other app can satisfy them.
@@ -28,7 +31,7 @@ DRY_RUN=0
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
-    -h|--help) sed -n '2,24p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,28p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -61,13 +64,13 @@ else
   echo "        flag (accepted risk, board item Q2)."
 fi
 
-# build_ruleset <name> <branch> <merge_method> <extra-check-or-empty> <with-workflows 0|1>
+# build_ruleset <name> <branch> <merge_methods, comma separated> <extra-check-or-empty> <with-workflows 0|1>
 build_ruleset() {
   local name="$1" branch="$2" method="$3" extra="$4" with_wf="$5"
   local checks=("${COMMON_CHECKS[@]}")
   [[ -n "$extra" ]] && checks+=("$extra")
   printf '%s\n' "${checks[@]}" | jq -R . | jq -s \
-    --arg name "$name" --arg ref "refs/heads/$branch" --arg method "$method" \
+    --arg name "$name" --arg ref "refs/heads/$branch" --arg methods "$method" \
     --argjson wf "$with_wf" --argjson repo_id "$REPO_ID" '
     {
       name: $name,
@@ -84,7 +87,7 @@ build_ruleset() {
             require_code_owner_review: false,
             require_last_push_approval: false,
             required_review_thread_resolution: false,
-            allowed_merge_methods: [$method] } },
+            allowed_merge_methods: ($methods | split(",")) } },
         { type: "required_status_checks", parameters: {
             strict_required_status_checks_policy: true,
             do_not_enforce_on_create: false,
@@ -104,6 +107,7 @@ apply_ruleset() { # json
   if [[ -n "$id" ]]; then echo "== ruleset '$name': UPDATE (id $id)"; else echo "== ruleset '$name': CREATE"; fi
   jq -c '{name, target, enforcement, ref: .conditions.ref_name.include[0],
           merge_methods: ([.rules[] | select(.type=="pull_request") | .parameters.allowed_merge_methods] | first),
+          up_to_date_required: ([.rules[] | select(.type=="required_status_checks") | .parameters.strict_required_status_checks_policy] | first),
           required_checks: ([.rules[] | select(.type=="required_status_checks")
             | [.parameters.required_status_checks[] | if .integration_id then "\(.context)@actions" else .context end]] | first),
           rules: [.rules[].type]}' <<<"$json"
@@ -129,8 +133,8 @@ apply_with_fallback() { # name branch method extra
   fi
 }
 
-apply_with_fallback "protect-main" "main" "merge" "ci/source-branch"
-apply_with_fallback "protect-dev" "dev" "squash" ""
+apply_with_fallback "protect-main" "main" "merge,squash" "ci/source-branch"
+apply_with_fallback "protect-dev" "dev" "squash,merge" ""
 
 # Release tags: nobody may delete or move a published v* tag. The release workflow only creates tags, so
 # creation stays open. A user-owned repo cannot scope this rule by actor, so anyone with write access can still

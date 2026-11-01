@@ -3,6 +3,7 @@
 # ci/test runs pytest from the repo root via scripts/run-pytest.sh and excludes tests/db (they need a running
 # database and run in ci/migrations, added in M0.6). Exit code 5 (no tests collected) counts as success.
 # Trigger is `pull_request` (never pull_request_target): fork PRs get no secrets. No secrets are used here.
+# There is no push trigger; ci/secrets scans only the PR's own range plus the working tree.
 name: pr-checks
 
 on:
@@ -137,5 +138,17 @@ jobs:
           echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tgz" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/gl" && tar -xzf gitleaks.tgz -C "$RUNNER_TEMP/gl" gitleaks
           rm gitleaks.tgz
-      - name: Scan history
-        run: '"$RUNNER_TEMP/gl/gitleaks" git --redact --no-banner --verbose .'
+      # Scope: exactly this PR's commits (base..head). Without --log-opts gitleaks scans every ref fetched into
+      # the runner, so another branch's commit could fail this PR (seen in run 41346276140).
+      # The SHAs come in via env, never interpolated into the script.
+      - name: Scan PR commits
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+          "$RUNNER_TEMP/gl/gitleaks" git --redact --no-banner --verbose --log-opts="${BASE_SHA}..${HEAD_SHA}" .
+      # Working tree of the checkout (PR merged into base): catches a secret already present in files.
+      - name: Scan working tree
+        run: '"$RUNNER_TEMP/gl/gitleaks" dir --redact --no-banner --verbose .'
