@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Approve, revoke, or list milestone kickoff-brief approvals.
+#
+# Human-only: this is the gate tech-lead's milestone-gate.py hook checks before any builder
+# spawns, and git-guard.py blocks agents from touching .claude/approvals or this script.
+#
+#   approve M1 [note]   write .claude/approvals/M1.approved with a timestamp and note
+#   approve --revoke M1 delete .claude/approvals/M1.approved
+#   approve --list      list every approval on file
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel 2>/dev/null || echo "${CLAUDE_PROJECT_DIR:-.}")"
+dir="$root/.claude/approvals"
+
+usage() {
+  echo "Usage: approve M<n> [note]" >&2
+  echo "       approve --revoke M<n>" >&2
+  echo "       approve --list" >&2
+  exit 1
+}
+
+[ "$#" -ge 1 ] || usage
+
+case "$1" in
+  --list)
+    mkdir -p "$dir"
+    shopt -s nullglob
+    files=("$dir"/M*.approved)
+    if [ ${#files[@]} -eq 0 ]; then
+      echo "No approvals on file."
+    else
+      for f in "${files[@]}"; do
+        echo "=== $(basename "$f" .approved) ==="
+        cat "$f"
+      done
+    fi
+    ;;
+  --revoke)
+    [ "$#" -ge 2 ] || usage
+    file="$dir/$2.approved"
+    if [ -f "$file" ]; then
+      rm "$file"
+      echo "Revoked $2."
+    else
+      echo "$2 was not approved."
+    fi
+    ;;
+  M*)
+    milestone="$1"
+    shift
+    note="$*"
+    mkdir -p "$dir"
+    stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    {
+      echo "approved_at=$stamp"
+      echo "approved_by=${USER:-unknown}"
+      echo "note=$note"
+    } > "$dir/$milestone.approved"
+    echo "Approved $milestone at $stamp."
+    ;;
+  *)
+    usage
+    ;;
+esac

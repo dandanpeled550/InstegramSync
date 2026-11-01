@@ -22,6 +22,8 @@ fixtures/raw/
 .claude/settings.local.json
 .claude/logs/
 .claude/worktrees/
+.claude/approvals/
+.claude/tests/.tmp/
 
 # Python
 __pycache__/

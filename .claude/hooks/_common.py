@@ -14,6 +14,20 @@ from typing import Any, Dict, List, Optional
 
 PROTECTED_BRANCHES = {"main", "dev"}
 
+# Shared with secret-scan.py (blocks writes) and agent-feed.py (redacts the activity log/handoffs).
+SECRET_PATTERNS = [
+    ("Meta/Facebook access token", r"EAA[A-Za-z0-9]{30,}"),
+    ("Instagram access token", r"IG(?:AA|QV|QW)[A-Za-z0-9_\-]{30,}"),
+    ("Google API key", r"AIza[0-9A-Za-z_\-]{35}"),
+    ("Anthropic API key", r"sk-ant-[A-Za-z0-9_\-]{20,}"),
+    ("OpenAI-style secret key", r"sk-(?:proj-)?[A-Za-z0-9]{32,}"),
+    ("GitHub token", r"gh[pousr]_[A-Za-z0-9]{36,}"),
+    ("Supabase secret key", r"sb_secret_[A-Za-z0-9_\-]{20,}"),
+    ("Private key", r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    ("JWT (e.g. Supabase service-role key)", r"eyJ[A-Za-z0-9_\-]{15,}\.eyJ[A-Za-z0-9_\-]{15,}\.[A-Za-z0-9_\-]{20,}"),
+]
+SECRET_PATTERNS_COMPILED = [(name, re.compile(rx)) for name, rx in SECRET_PATTERNS]
+
 
 def read_input() -> Dict[str, Any]:
     try:
@@ -29,7 +43,15 @@ def block(message: str) -> None:
 
 
 def project_dir(data: Dict[str, Any]) -> Path:
-    return Path(os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or os.getcwd())
+    """Repo root. Derived from this file's own location (.claude/hooks/_common.py) first, since
+    CLAUDE_PROJECT_DIR goes stale when a session's project folder moves or a hook runs inside a
+    git worktree checkout. CLAUDE_PROJECT_DIR/cwd are fallbacks for the case this file is invoked
+    from somewhere else entirely.
+    """
+    try:
+        return Path(__file__).resolve().parents[2]
+    except IndexError:
+        return Path(os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or os.getcwd())
 
 
 def load_config(data: Dict[str, Any], name: str) -> Dict[str, Any]:

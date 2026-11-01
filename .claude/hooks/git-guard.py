@@ -31,6 +31,7 @@ RESTRICTED_SHELL = {
 SHELLS = {"bash", "sh", "zsh"}
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 ENV_TOKEN = re.compile(r"(^|/)\.env(\.[A-Za-z0-9_-]+)?$")
+APPROVAL_PATHS = (".claude/approvals", ".claude/bin/approve")
 GIT_GLOBAL_WITH_ARG = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
 PUSH_OPTS_WITH_ARG = {"--repo", "-o", "--push-option", "--receive-pack", "--exec"}
 COMMIT_LIKE = {"commit", "merge", "rebase", "cherry-pick", "revert", "am"}
@@ -89,6 +90,12 @@ class Guard:
 
         if self.agent and any(ENV_TOKEN.search(t) and not t.endswith(".env.example") for t in seg):
             self.deny("agents never read or source .env files through the shell.")
+
+        if self.agent and any(p in t for t in seg for p in APPROVAL_PATHS):
+            self.deny(
+                "agents never touch .claude/approvals or .claude/bin/approve — milestone approval is a "
+                "human-only gate. Ask the human to run it."
+            )
 
         if "--no-verify" in seg:
             self.deny("--no-verify skips the safety hooks.")

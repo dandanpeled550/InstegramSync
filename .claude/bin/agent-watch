@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Live view of the agent activity feed written by .claude/hooks/agent-feed.py.
+#
+#   agent-watch            tail .claude/logs/agents/all.log, one color per agent
+#   agent-watch <agent>    tail that agent's own log
+#   agent-watch handoffs   list the 10 newest handoffs, show the latest
+#   agent-watch prs        poll `gh pr list` + `git worktree list` every 30s
+set -u
+
+root="$(git rev-parse --show-toplevel 2>/dev/null || echo "${CLAUDE_PROJECT_DIR:-.}")"
+log_dir="$root/.claude/logs/agents"
+handoff_dir="$root/.claude/logs/handoffs"
+mkdir -p "$log_dir" "$handoff_dir"
+
+# Assigns each agent name a stable color (for the lifetime of this tail) and prints it in that color.
+colorize() {
+  awk '
+    function color(name) {
+      if (name in seen) return seen[name]
+      c = (next_color % 6) + 31
+      seen[name] = c
+      next_color++
+      return c
+    }
+    { printf "\033[%dm%s\033[0m\n", color($2), $0; fflush() }
+  '
+}
+
+case "${1:-}" in
+  "")
+    touch "$log_dir/all.log"
+    tail -F -n 100 "$log_dir/all.log" | colorize
+    ;;
+  handoffs)
+    echo "Newest handoffs:"
+    ls -t "$handoff_dir" 2>/dev/null | head -10
+    latest="$(ls -t "$handoff_dir" 2>/dev/null | head -1)"
+    if [ -n "$latest" ]; then
+      echo
+      echo "--- $latest ---"
+      cat "$handoff_dir/$latest"
+    else
+      echo "(none yet)"
+    fi
+    ;;
+  prs)
+    while true; do
+      clear
+      echo "=== gh pr list ($(date -u +%H:%M:%SZ)) ==="
+      gh pr list --json number,title,headRefName,labels,statusCheckRollup \
+        -q '["#","TITLE","BRANCH","LABELS","CHECKS"], (.[] | [("#"+(.number|tostring)), .title, .headRefName, ([.labels[].name] | join(",")), ([.statusCheckRollup[] | (.conclusion // .status // "pending")] | join(","))]) | @tsv' \
+        2>&1 | column -t -s "$(printf '\t')"
+      echo
+      echo "=== git worktree list ==="
+      git -C "$root" worktree list
+      sleep 30
+    done
+    ;;
+  *)
+    agent="$1"
+    f="$log_dir/$agent.log"
+    touch "$f"
+    echo "Tailing $f"
+    tail -F -n 100 "$f"
+    ;;
+esac

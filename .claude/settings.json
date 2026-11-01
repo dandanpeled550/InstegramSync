@@ -82,14 +82,20 @@
       {
         "matcher": "Edit|Write|MultiEdit|NotebookEdit",
         "hooks": [
-          { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/enforce-ownership.py\"" },
-          { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/secret-scan.py\"" }
+          { "type": "command", "command": "python3 \"$(git rev-parse --show-toplevel 2>/dev/null || echo \"$CLAUDE_PROJECT_DIR\")/.claude/hooks/enforce-ownership.py\"" },
+          { "type": "command", "command": "python3 \"$(git rev-parse --show-toplevel 2>/dev/null || echo \"$CLAUDE_PROJECT_DIR\")/.claude/hooks/secret-scan.py\"" }
         ]
       },
       {
         "matcher": "Bash",
         "hooks": [
-          { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/git-guard.py\"", "timeout": 30 }
+          { "type": "command", "command": "python3 \"$(git rev-parse --show-toplevel 2>/dev/null || echo \"$CLAUDE_PROJECT_DIR\")/.claude/hooks/git-guard.py\"", "timeout": 30 }
+        ]
+      },
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          { "type": "command", "command": "python3 \"$(git rev-parse --show-toplevel 2>/dev/null || echo \"$CLAUDE_PROJECT_DIR\")/.claude/hooks/milestone-gate.py\"" }
         ]
       }
     ],
@@ -97,27 +103,35 @@
       {
         "matcher": "Edit|Write|MultiEdit",
         "hooks": [
-          { "type": "command", "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/format-file.sh\"" }
+          { "type": "command", "command": "bash \"$(git rev-parse --show-toplevel 2>/dev/null || echo \"$CLAUDE_PROJECT_DIR\")/.claude/hooks/format-file.sh\"" }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "python3 \"$(git rev-parse --show-toplevel 2>/dev/null || echo \"$CLAUDE_PROJECT_DIR\")/.claude/hooks/agent-feed.py\"" }
         ]
       }
     ],
     "SubagentStart": [
       {
         "hooks": [
-          { "type": "command", "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/log-subagent.sh\"" }
+          { "type": "command", "command": "bash \"$(git rev-parse --show-toplevel 2>/dev/null || echo \"$CLAUDE_PROJECT_DIR\")/.claude/hooks/log-subagent.sh\"" },
+          { "type": "command", "command": "python3 \"$(git rev-parse --show-toplevel 2>/dev/null || echo \"$CLAUDE_PROJECT_DIR\")/.claude/hooks/agent-feed.py\"" }
         ]
       }
     ],
     "SubagentStop": [
       {
         "hooks": [
-          { "type": "command", "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/log-subagent.sh\"" }
+          { "type": "command", "command": "bash \"$(git rev-parse --show-toplevel 2>/dev/null || echo \"$CLAUDE_PROJECT_DIR\")/.claude/hooks/log-subagent.sh\"" },
+          { "type": "command", "command": "python3 \"$(git rev-parse --show-toplevel 2>/dev/null || echo \"$CLAUDE_PROJECT_DIR\")/.claude/hooks/agent-feed.py\"" }
         ]
       },
       {
         "matcher": "receiver-engineer|data-engineer|pipeline-engineer|ai-engineer|web-engineer|devops-engineer|test-engineer",
         "hooks": [
-          { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/quality-gate.py\"", "timeout": 1200 }
+          { "type": "command", "command": "python3 \"$(git rev-parse --show-toplevel 2>/dev/null || echo \"$CLAUDE_PROJECT_DIR\")/.claude/hooks/quality-gate.py\"", "timeout": 1200 }
         ]
       }
     ]
