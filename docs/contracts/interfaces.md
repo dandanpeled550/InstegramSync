@@ -13,7 +13,10 @@
 - Every model call is `async`.
 - All text that originates from Instagram (caption, transcript, on-screen text, and anything a model derived
   from them, including titles) is **untrusted data**. Adapters delimit it as data in prompts and validate
-  outputs; the UI renders it as plain text.
+  outputs; the UI renders it as plain text. The detailed prompt-injection limits for adapters (no tools,
+  function calling, grounding or URL fetching; unknown `suggested_category` coerced to `None`; length caps on
+  `VisionResult` text; control/bidi characters stripped from titles) are added to this contract before the
+  M3/M4 adapters are built.
 - Categories are **data** (`categories` table), so category values are typed `str` (a `Category.slug`), not
   `Literal["food","travel"]`. Validation happens at run time against the loaded categories.
 - `PLAN.md` calls the decision type `Decision` in one sketch; its name is `StageDecision`.
@@ -26,10 +29,10 @@
 | `backend/app/decide/types.py` | ai-engineer | `Category`, `Usage`, `StageDecision`, `MediaItem`, `VisionResult`, `ModelError`, `DeciderError`, `VisionError` |
 | `backend/app/analyze/evidence.py` | pipeline-engineer | `StageName`, `StageNumber`, `StageRecord`, `Evidence`, `ReviewReason`, `CascadeResult` |
 | `backend/app/decide/base.py` | ai-engineer | `Decider` protocol |
-| `backend/app/decide/policy.py` | ai-engineer | thresholds, `should_stop` |
+| `backend/app/decide/policy.py` | ai-engineer | thresholds, `RUBRIC`, `should_stop` (PLAN §0's `decide/rubric.py` is folded in here — there is no `rubric.py`) |
 | `backend/app/analyze/vision.py` | ai-engineer | `VisionModel` protocol (+ the Gemini adapter) |
 | `backend/app/enrich/title.py` | ai-engineer | `Titler` protocol, `fallback_title`, `TITLE_MAX_CHARS` |
-| `backend/app/ingest/parser.py` | pipeline-engineer | `ParsedPayload`, `UnsupportedPayload`, `parse` |
+| `backend/app/ingest/parser.py` | pipeline-engineer | `PERMALINK_RE`, `ParsedPayload`, `UnsupportedPayload`, `parse` |
 | `backend/app/process.py` | pipeline-engineer | `RunSummary`, `run_worker` |
 
 Import direction: `db/models` and `decide/types` import nothing from `app`; `analyze/evidence` imports
@@ -52,8 +55,10 @@ PostKind = Literal["post", "carousel", "reel"]
 class Post:
     """A `posts` row as claimed by the worker (see schema.md §2.2).
 
-    Fields after `evidence` are filled by the worker from `parse(raw_payload)`
-    (`dataclasses.replace(post, kind=..., ...)`); they are None straight after the claim.
+    The repo builds a Post from the claimed row's columns up to and including `evidence` only. The fields
+    after `evidence` are always None straight after the claim (also on a retry, even though the row still
+    holds the previous run's values); the worker fills them from `parse(raw_payload)`
+    (`dataclasses.replace(post, kind=..., ...)`).
     """
     id: UUID
     message_mid: str
@@ -72,12 +77,17 @@ class Post:
 
 ```python
 # backend/app/ingest/parser.py
+PERMALINK_RE: re.Pattern[str] = re.compile(r"^https://www\.instagram\.com/(p|reel)/[A-Za-z0-9_-]+/?$")
+# Widening it (e.g. after the M1 spike) is a contract change. The SPA applies the same check before
+# rendering a permalink as a link (api.md).
+
+
 @dataclass(frozen=True, slots=True)
 class ParsedPayload:
     """Typed fields extracted from one webhook `messaging` event. All payload knowledge lives in parser.py."""
     kind: PostKind
     ig_media_id: str | None
-    permalink: str | None        # https://www.instagram.com/{p|reel}/{shortcode}/ — derivation verified in M1
+    permalink: str | None        # None unless it fully matches PERMALINK_RE — derivation verified in M1
     caption: str | None          # as found; no cleaning
     attachment_count: int        # >= 1
 
@@ -163,7 +173,9 @@ class ModelError(Exception):
     """Base for adapter failures, raised only after the adapter's own retries are exhausted.
 
     `retryable` = True for transient causes (timeout, 429, 5xx), False otherwise (bad request,
-    invalid/unsafe output, unknown category). Messages never contain API keys or signed URLs.
+    invalid/unsafe output, unknown category). The message is short adapter-written text (e.g.
+    "timeout after 3 attempts") and is stored in `posts.error` (schema.md §3.1): it never contains API
+    keys, signed URLs, model output or post content.
     """
     retryable: bool
 
@@ -217,11 +229,15 @@ class VisionModel(Protocol):
 
 ## 5. Policy — `decide/policy.py`
 
-Thresholds and the rubric are AI behavior and change only with an eval report, so they live with
-`ai-engineer`, not in `config.py` (resolves PLAN §3 "config.py" vs AGENTS_PLAN §4.6 "decide/policy.py";
-see ADR 0002).
+Thresholds, the rubric and `should_stop` are AI behavior and change only with an eval report, so they live
+with `ai-engineer` (ADR 0002). PLAN §3 puts thresholds in `config.py` and the rubric in `decide/rubric.py`;
+AGENTS_PLAN §4.6 lists `should_stop` among pipeline-engineer's pure functions; AGENTS_PLAN §4.7 puts rubric
+and thresholds in `decide/policy.py`. This contract puts all three in `decide/policy.py`. `should_stop` stays
+a pure function, which the cascade (pipeline-engineer) calls.
 
 ```python
+RUBRIC: Mapping[str, Mapping[int, str]]  # category slug → score 0–3 → criterion text (PLAN §3 table);
+                                         # used by JevDecider's informativeness question
 CATEGORY_CONFIDENCE_MIN: float = 0.8
 REQUIRED_INFO: Mapping[str, int] = {"food": 3, "travel": 2}
 REQUIRED_INFO_DEFAULT: int = 3          # for a category slug missing from REQUIRED_INFO
@@ -278,10 +294,14 @@ class Evidence:
         """Deterministic plain-text rendering of all evidence (caption + every stage's vision fields),
         labeled by source. Adapters may use it or their own delimited rendering."""
     def to_json(self) -> dict[str, Any]:
-        """The `stages`/`caption` part of the evidence JSON below (version 1)."""
+        """The `caption`/`clean_caption`/`stages` part of the evidence JSON below (version 1).
+        Generic: built with `dataclasses.asdict` (tuples become lists, None becomes null) — no per-field code."""
     @classmethod
     def from_json(cls, data: Mapping[str, Any]) -> "Evidence":
-        """Inverse of to_json; ValueError on unknown `version`. Ignores extra keys."""
+        """Inverse of to_json; ValueError on unknown `version`. Generic: each nested dataclass
+        (StageRecord, VisionResult, StageDecision, Usage) is built from the keys named by
+        `dataclasses.fields(T)` — extra keys are ignored, missing keys take the field default, a missing
+        key without a default raises ValueError."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,20 +319,27 @@ class CascadeResult:
     review_reason: ReviewReason | None = None
 ```
 
+Because serialization is generic, ai-engineer can add a field to `VisionResult`, `StageDecision` or `Usage`
+without touching `analyze/evidence.py`. Rule: **every field added after v0 has a default**, so evidence
+stored earlier still loads.
+
 `review_reason` when no stage stopped: `cross_check_mismatch` if the last stage's vision
 `suggested_category` disagrees with its decision, otherwise `below_threshold`. A single photo whose peek
 doesn't stop is `below_threshold` (Stage 3 doesn't apply to it).
 
-**Retry with media gone:** if `post.media_path is None` and `post.evidence` holds vision for stage 2/3, the
-cascade reuses it (`with_vision(..., reused=True)`) instead of calling `VisionModel`; decisions are always
-recomputed. With neither media nor stored vision, stages 2–3 are skipped.
+**Retry with media gone:** if the post has no stored media (`media_path` is `None`, or the listing under it
+is empty — storage.md §4) and `post.evidence` holds vision for stage 2/3, the cascade reuses it
+(`with_vision(..., reused=True)`) instead of calling `VisionModel`; decisions are always recomputed. With neither media nor stored vision, stages 2–3 are skipped.
 
 **Errors:** `DeciderError` / `VisionError` propagate out of the cascade; the worker marks the post `failed`
-with `error = f"{type(e).__name__}: {e}"` (truncated to 500 chars). Media is kept for retry.
+with `error = f"{type(e).__name__}: {e}"` (truncated to 500 chars). Any other per-post exception is stored as
+`error = f"internal_error: {type(e).__name__}"` — never its message; details go to local logs only. The
+full list of codes is [schema.md §3.1](schema.md#31-postserror-codes). Media is kept for retry.
 
 ### Evidence JSON (`posts.evidence`)
 
-Written by the worker with the result. `manual_override` is added by `PATCH /api/posts/{id}` (api.md).
+Written by the worker with the result. `PATCH /api/posts/{id}` (api.md) changes exactly three keys: it sets
+`needs_review` to `false`, `review_reason` to `null`, and **sets** (overwrites) `manual_override`.
 
 ```json
 {
@@ -344,7 +371,9 @@ Written by the worker with the result. `manual_override` is added by `PATCH /api
 }
 ```
 
-`manual_override` when set: `{"category": "food", "previous_category": "travel" | null, "at": "2026-11-01T12:00:00Z"}`.
+`manual_override` when set: `{"category": "food", "previous_category": "travel" | null, "previous_review_reason":
+"below_threshold" | null, "at": "2026-11-01T12:00:00Z"}` — only the latest override is kept; `previous_*`
+record the row's category and `review_reason` just before this override (useful for evals).
 Field rules: unknown keys are ignored by readers; `version` bumps only on breaking shape changes
 (with an ADR); `null` (not missing) for absent optional values.
 
@@ -358,14 +387,16 @@ class Titler(Protocol):
     """Short title from accumulated evidence; text-only call to the vision model's vendor (PLAN §5)."""
 
     async def title(self, evidence: Evidence, category: Category | None) -> str:
-        """Returns a single-line title, 1..TITLE_MAX_CHARS chars, trimmed, no hashtags/@mentions.
+        """Returns a single-line title, 1..TITLE_MAX_CHARS chars (counted with `len()`, i.e. code points, as
+        `char_length` does), trimmed, no hashtags/@mentions.
         Raises ModelError on failure — the caller then uses fallback_title(). A title failure never
         fails the post."""
 
 
 def fallback_title(caption: str | None) -> str | None:
     """Pure. First sentence of the caption with emojis, hashtags and @mentions removed, whitespace
-    collapsed, cut at a word boundary to <= TITLE_MAX_CHARS (ending with "…" if cut).
+    collapsed, cut at a word boundary so that the result INCLUDING the trailing "…" (added if cut) is
+    <= TITLE_MAX_CHARS code points.
     None if nothing remains. Example: "Crispy smashed potatoes 🥔. Boil, smash… #recipe" → "Crispy smashed potatoes"
     """
 ```
@@ -392,7 +423,7 @@ class RunSummary:
 
 async def run_worker(*, batch_size: int | None = None) -> RunSummary:
     """Recover stuck rows, then claim and process batches until a claim returns no rows, then run the
-    media cleanup sweep (storage.md §4). batch_size defaults to config.CLAIM_BATCH_SIZE (20).
+    media cleanup sweep (storage.md §4). batch_size defaults to config.CLAIM_BATCH_SIZE (5).
     Per-post failures are recorded on the row and never raised. Raises only for infrastructure failures
     (DB unreachable, missing config) before or between batches. Safe to run concurrently with itself."""
 ```
@@ -410,5 +441,8 @@ and [storage.md §4](storage.md#4-lifecycle).
   score-with-criteria exist as PLAN assumes (third-party description only). If confidence is unavailable,
   `JevDecider` must derive one or we switch to a structured-output LLM behind `Decider` — ADR either way.
 - **Gemini clip offsets + fps + pricing (researcher):** assumed for `mode="peek"`; unverified.
+- **`Category` home:** it is a `categories` row loaded by `db/repo.py` but defined in `decide/types.py`. That
+  works (no cycle); moving it to `db/models.py` is a possible later cleanup, left as is in v0 because the
+  type split is under review.
 - **Carousel media in payloads (M1):** if payloads don't include all images, `mode="full"` for carousels sees
   only what's stored, and `attachment_count` semantics may change.

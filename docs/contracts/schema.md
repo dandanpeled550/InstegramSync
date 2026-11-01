@@ -53,7 +53,7 @@ One row per shared Instagram message. The table is also the work queue (see §3)
 | `sender_id` | `text` | no | — | receiver | Instagram-scoped id of the sender (already allow-listed) |
 | `ig_media_id` | `text` | yes | — | worker | from `raw_payload` via `parser.py` |
 | `kind` | `text` | yes | — | worker | `post` \| `carousel` \| `reel` |
-| `permalink` | `text` | yes | — | worker | `https://www.instagram.com/...` link (derivation verified in M1) |
+| `permalink` | `text` | yes | — | worker | Instagram link; only a value matching `PERMALINK_RE` ([interfaces.md §1](interfaces.md#1-posts--dbmodelspy-ingestparserpy)) is stored, else `null` (derivation verified in M1) |
 | `caption` | `text` | yes | — | worker | raw caption as found in the payload |
 | `media_path` | `text` | yes | — | receiver, worker | Storage folder prefix `"{id}/"` in bucket `media`; `null` = no media stored (never stored, or deleted after processing). See [storage.md](storage.md) |
 | `title` | `text` | yes | — | worker | ≤ 60 characters; `null` = UI shows "Untitled" |
@@ -67,7 +67,7 @@ One row per shared Instagram message. The table is also the work queue (see §3)
 | `status` | `text` | no | `'received'` | all | state machine, §3 |
 | `current_stage` | `smallint` | yes | — | worker | stage in progress while `analyzing` (0–3) |
 | `claimed_at` | `timestamptz` | yes | — | worker | set on claim; used for stuck-row recovery |
-| `error` | `text` | yes | — | receiver, worker | short, human-readable; never secrets, tokens or signed URLs; ≤ 500 chars by convention |
+| `error` | `text` | yes | — | receiver, worker | a fixed error code from §3.1 — never raw exception text, secrets, tokens, URLs or post content; ≤ 500 chars |
 | `raw_payload` | `jsonb` | no | — | receiver | the webhook `messaging` event exactly as received (shape: `payloads.md`, M1) |
 | `created_at` | `timestamptz` | no | `now()` | DB | time the receiver stored the row |
 | `search_tsv` | `tsvector` | — | generated | DB | `generated always as (to_tsvector('simple', coalesce(title,'') \|\| ' ' \|\| coalesce(search_text,''))) stored` |
@@ -108,7 +108,13 @@ Known keys (v0):
 | `ig_access_token` | human (initial, one-time SQL in the dashboard — human gate), `refresh-token` function (rotation) | `ig-webhook` (ack DM), worker `meta/client.py` ("Saved" DM), `refresh-token` |
 
 The migration creates the table **empty**. `seed.sql` may insert a synthetic value
-(`'local-dev-not-a-token'`) for local development only.
+(`'local-dev-not-a-token'`) for local development only. After the human enters the real token in the
+dashboard SQL editor, they delete that query from the editor's history/snippets.
+
+Forward reference (M2 entry condition, not v0): pg_cron's call to `refresh-token` reads its credential from
+Supabase Vault at run time and the function checks a dedicated `CRON_SECRET`; no key or token ever appears
+in migration SQL. Moving `app_secrets` out of the PostgREST-exposed `public` schema (or into Vault) is
+considered in the same M2 contract update.
 
 ## 3. `posts.status` state machine
 
@@ -125,29 +131,68 @@ The migration creates the table **empty**. `seed.sql` may insert a synthetic val
    └────────────┘    └──► failed ───────────────────────┘
 ```
 
+"Result columns" below = `ig_media_id, kind, permalink, caption, title, search_text, category_id, confidence,
+relevant, informativeness, decided_at_stage, evidence`.
+
 | From | To | Actor | Exact write |
 |---|---|---|---|
 | — | `received` | receiver | `insert (message_mid, sender_id, raw_payload) … on conflict (message_mid) do nothing returning id` |
 | `received` | `analyzing` | worker claim | `status='analyzing', current_stage=0, claimed_at=now()` — see claim query below (`error` is left as-is so a receiver `media_copy_*` code stays visible until the result is written) |
 | `analyzing` | `received` | worker recover | rows with `claimed_at < now() - interval '30 minutes'`: `status='received', current_stage=null, claimed_at=null` |
-| `analyzing` | `done` / `needs_review` | worker | result columns + `current_stage=decided_at_stage, error=null`; then media cleanup ([storage.md §4](storage.md#4-lifecycle)) |
-| `analyzing` | `failed` | worker | `status='failed', error=<message>`; `current_stage` left as-is (shows where it failed); media kept |
-| `needs_review` / `done` | `done` | API `PATCH /api/posts/{id}` | `category_id=<chosen>, status='done'`, append `evidence.manual_override` |
+| `analyzing` | `done` / `needs_review` | worker | result columns + `current_stage=coalesce(decided_at_stage, 0), error=null`; then media cleanup ([storage.md §4](storage.md#4-lifecycle)) |
+| `analyzing` | `failed` | worker | `status='failed', error=<code from §3.1>`; `current_stage` left as-is (shows where it failed); media kept |
+| `needs_review` / `done` | `done` | API `PATCH /api/posts/{id}` | `category_id=<chosen>, status='done'`; in `evidence`: set `needs_review=false`, `review_reason=null`, and **set** (overwrite, not append) `manual_override` (interfaces.md §6) |
 | `done` / `needs_review` / `failed` | `received` | API `POST /api/posts/{id}/retry` | `status='received', current_stage=null, claimed_at=null, error=null` (result columns kept until overwritten) |
 | any | (row deleted) | API `DELETE /api/posts/{id}` | delete Storage objects, then `delete from posts where id=$1` |
 
-Invariants:
-- Every worker write after the claim is **conditional**: `where id=$1 and status='analyzing' and claimed_at=$claimed_at`.
-  Zero rows updated means the row was recovered, retried or deleted meanwhile → the worker drops its result
-  (logs `id` only) and moves on. This makes overlapping runs (CLI + "Process now") safe.
-- `status in ('done','needs_review')` ⇒ `evidence is not null`.
-- `decided_at_stage` and `category_id` may be `null` only for `needs_review` with
-  `evidence.review_reason = 'no_evidence'` (no stage could run: no usable caption and no media).
-- `status='done'` ⇒ `category_id is not null`.
+**Write conditions.** Every write above is conditional, and "zero rows updated" has a defined meaning:
+
+| Write | `where` condition | Zero rows updated means |
+|---|---|---|
+| claim | the claim query below | nothing to claim |
+| recover | `status='analyzing' and claimed_at < now() - interval '30 minutes'` | nothing stuck |
+| result (`done` / `needs_review`) and `failed` | `id=$1 and status='analyzing' and claimed_at=$claimed_at` | the row was recovered, retried or deleted meanwhile → the worker drops its result (logs `id` only), counts it in `RunSummary.dropped`, sends no DM |
+| media cleanup — right after the result write **and** the end-of-run sweep (storage.md §4) | `id=$1 and status in ('done','needs_review') and media_path is not null`; sets only `media_path=null`, and only after the objects were deleted | the row was retried, deleted or already cleaned → nothing to do. Objects already deleted are harmless: an empty prefix means "no media" (storage.md §4) |
+| API PATCH | `id=$1 and status in ('done','needs_review')` | `404` if the row is gone, else `409 invalid_state` |
+| API retry | `id=$1 and status in ('done','needs_review','failed')` | `404` if the row is gone, else `409 invalid_state` |
+| API delete | `id=$1` | `404` |
+
+This makes overlapping runs (CLI + "Process now") and API actions during a run safe. M4 adds the "Saved" DM:
+it is sent only after a result write updated exactly 1 row (its text for `needs_review` is fixed in the M4
+contract update).
+
+**Per-status invariants** (true for every row, whoever wrote it). "—" = unspecified: `null` on a fresh row,
+the previous run's values after a retry (kept until overwritten). Readers must not treat "—" values as the
+current result — the one deliberate use is the worker reading the previous `evidence` on a retry to reuse
+stored vision (interfaces.md §6).
+
+| `status` | `category_id` | `decided_at_stage`, `confidence`, `relevant`, `informativeness` | `evidence` | `evidence.review_reason` | `current_stage` | `claimed_at` | `error` |
+|---|---|---|---|---|---|---|---|
+| `received` | — | — | — | — | `null` | `null` | `null` or `media_copy_*` |
+| `analyzing` | — | — | — | — | 0–3 | not null | `null` or `media_copy_*` |
+| `done` | **not null** | not null — except all four `null` when `evidence.manual_override` is set and the overridden result was `no_evidence` | not null, `needs_review=false` | `null` | 0–3 | last claim | `null` |
+| `needs_review` | not null — `null` iff `review_reason='no_evidence'` | not null — all four `null` iff `review_reason='no_evidence'` | not null, `needs_review=true` | **not null** | 0–3 | last claim | `null` |
+| `failed` | — | — | — | — | stage where it failed (0–3) | last claim | **not null**, a §3.1 code |
+
+`no_evidence` = no stage could run (no usable caption and no media, nor stored vision). Also:
 - No transition skips `analyzing` except the API transitions listed above.
 - Nothing ever writes `status='analyzing'` except the claim.
 
 These invariants are enforced in code (repo layer), not by DB constraints, in v0.
+
+### 3.1 `posts.error` codes
+
+`error` holds exactly one of these. Raw exception text, tracebacks, URLs, tokens and post content never go in
+`error` (they go to local logs only, and logs never contain secrets). New codes are an additive contract change.
+
+| Code | Written by | When |
+|---|---|---|
+| `media_copy_partial` | receiver | some attachments could not be stored (storage.md §4) |
+| `media_copy_failed` | receiver | no attachment could be stored |
+| `unsupported_payload: <reason>` | worker | `parse()` raised `UnsupportedPayload`; `<reason>` is its machine code (`no_attachment`, `unsupported_type`, … — final list in `payloads.md`, M1) |
+| `media_download_failed` | worker | a listed object could not be downloaded (storage.md §5) |
+| `DeciderError: <message>` / `VisionError: <message>` | worker | an adapter raised a `ModelError` subclass; `<message>` is the adapter's own message, which never contains keys, signed URLs, model output or post content (interfaces.md §2) |
+| `internal_error: <ExceptionType>` | worker | any other per-post exception — only the class name, e.g. `internal_error: KeyError` |
 
 **Claim query** (`backend/app/db/repo.py`, M3):
 
@@ -160,14 +205,17 @@ update posts
       and (media_path is not null or created_at < now() - interval '5 minutes')
     order by created_at
     for update skip locked
-    limit 20)
+    limit 5)
 returning *;
 ```
 
 The `media_path is not null or created_at < now() - 5 min` condition gives the receiver's background media
 copy time to finish before a fast "Process now" claims the row. After 5 minutes a row with no media is
-processed caption-only (download failed, or nothing to download). The 5 minutes and batch size 20 are
+processed caption-only (download failed, or nothing to download). The 5 minutes and batch size 5 are
 `config.py` settings (`MEDIA_WAIT_MINUTES`, `CLAIM_BATCH_SIZE`), the 30 minutes is `STUCK_AFTER_MINUTES`.
+Keep `CLAIM_BATCH_SIZE × worst-case time per post` (a Stage 3 reel: a few minutes) well under
+`STUCK_AFTER_MINUTES`; otherwise a second run recovers rows the first run has claimed but not reached yet.
+The conditional writes keep that correct, but it pays for the model calls twice.
 
 ## 4. Indexes
 
@@ -195,21 +243,55 @@ system talks to Postgres as `anon` or `authenticated` — the browser only talks
 | `posts` | enabled | **none** | no access | no access | full |
 | `app_secrets` | enabled | **none** | no access | no access | full |
 
-Defense in depth — Supabase's default privileges grant table rights to `anon`/`authenticated` on every new
-`public` table, so the migration also runs, for each table above:
+Defense in depth — Supabase's default privileges grant table, sequence and function rights to
+`anon`/`authenticated` on every new object in `public`, and Postgres grants `EXECUTE` on new functions to
+`PUBLIC`. The initial migration therefore runs:
 
 ```sql
-revoke all on table <table> from anon, authenticated;
+-- existing objects
+revoke all on table categories, posts, app_secrets from anon, authenticated;
+revoke all on sequence categories_id_seq from anon, authenticated;
+revoke execute on all functions in schema public from public, anon, authenticated;
+
+-- future objects created by the migration role (postgres)
+alter default privileges for role postgres in schema public revoke all on tables    from anon, authenticated;
+alter default privileges for role postgres in schema public revoke all on sequences from anon, authenticated;
+alter default privileges for role postgres in schema public revoke all on functions from anon, authenticated;
+alter default privileges for role postgres revoke execute on functions from public;  -- global: a per-schema
+                                                                                      -- entry can't remove it
 ```
 
-and `revoke all on sequence categories_id_seq from anon, authenticated;`.
+Rules for every later migration (also in §6):
+- A new table gets `enable row level security` and `revoke all … from anon, authenticated` **in the same
+  migration** that creates it; a new sequence or function gets the matching revoke (`revoke execute … from
+  public, anon, authenticated` for functions).
+- A view is created `with (security_invoker = true)` (otherwise it bypasses RLS) and revoked like a table.
+  Materialized views and `security definer` functions in `public` need an ADR.
+- Optional hardening (devops-engineer, `supabase/config.toml`): `[auth] enable_signup = false`, so nobody can
+  mint an `authenticated` JWT.
 
-**What `tests/db/` (M0.5) must assert**, for each of the three tables and for each role `anon` and
-`authenticated` (e.g. `set local role anon` inside a transaction):
-- `select`, `insert`, `update`, `delete` each fail with SQLSTATE `42501` (`insufficient_privilege`).
-- RLS is enabled: `pg_class.relrowsecurity = true`.
-- No policies exist: `select count(*) from pg_policies where schemaname='public' and tablename=<t>` = 0.
-- The two `categories` reference rows exist after migration.
+**What `tests/db/` (M0.5) must assert.** Assertions are **catalog-wide** — they enumerate `public` at test time
+instead of a fixed list, so an object added later without RLS or revokes fails the existing tests. Roles =
+`anon` and `authenticated`.
+- For every relation in `public` with `relkind in ('r','p','v','m','f')` (tables, partitioned tables, views,
+  materialized views, foreign tables): `has_table_privilege(role, oid, p)` is false for each `p` in `SELECT,
+  INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER`.
+- For every table in `public` (`relkind in ('r','p')`): `pg_class.relrowsecurity = true`.
+- For every view in `public`: `reloptions` contains `security_invoker=true`.
+- For every sequence in `public`: `has_sequence_privilege(role, oid, 'USAGE,SELECT,UPDATE')` is false; and
+  `select nextval('categories_id_seq')` as each role raises SQLSTATE `42501`.
+- For every function in `public` that is not an extension member (`pg_depend.deptype <> 'e'`):
+  `has_function_privilege(role, oid, 'EXECUTE')` is false.
+- **Future objects:** inside a rolled-back transaction, as `postgres`, create a throwaway table, sequence,
+  function and view in `public`; each role has no privilege on any of them (proves the default privileges).
+  And no `pg_default_acl` entry of `defaclrole = 'postgres'` (global or for `public`) grants anything to
+  either role via `aclexplode(defaclacl)`, nor `EXECUTE` to `PUBLIC` (grantee `0`). (Entries owned by
+  Supabase's own roles are out of scope; the throwaway-object check covers what our migrations create.)
+- For each of `categories`, `posts`, `app_secrets` and each role (`set local role …` in a transaction):
+  `select`, `insert`, `update`, `delete` each fail with SQLSTATE `42501` (`insufficient_privilege`).
+- No policies in `public`: `select count(*) from pg_policies where schemaname = 'public'` = 0.
+- The two `categories` reference rows exist after migration; `categories_slug_format` rejects a bad slug
+  (e.g. `'Food'`).
 - As the owner/service role: an insert into `posts` with only `message_mid`, `sender_id`, `raw_payload` succeeds
   with `status='received'`, a duplicate `message_mid` with `on conflict do nothing` inserts nothing, and each
   named `check` constraint in §2.2 rejects one out-of-range value.
@@ -231,10 +313,13 @@ staging/production are migrated by CI only ([AGENTS_PLAN §15.6](../AGENTS_PLAN.
    narrow constraints. Drops and other destructive SQL need an ADR and human approval.
 
 Also:
+- Every new table, view, sequence and function follows the §5 rules (RLS + revokes, `security_invoker`) in
+  the migration that creates it.
 - Migrations are append-only. An applied migration is never edited; fix forward with a new one.
 - No renames in place (add new → migrate → drop old). No `not null` on an existing column without a default
   and a backfill first.
-- Each migration changes one concern and is reflected here in the same PR (or in a preceding contract PR).
+- Each migration changes one concern. Schema changes go **architect-first**: a contract PR updates this file
+  (with an ADR when needed) and merges before data-engineer's migration PR starts.
 - Changing the `search_tsv` expression = drop + re-add the generated column → treat as expand/contract with
   an ADR.
 

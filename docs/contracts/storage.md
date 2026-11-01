@@ -61,29 +61,38 @@ media/6f1c2a9e-0b7d-4e3a-9a51-2d4c8e7f1a00/02.jpg
 - No public URLs and no signed URLs are handed to the browser in v0 — the UI links to Instagram, not to
   stored media.
 - `tests/db/` (M0.5) asserts: bucket `media` exists with `public = false`, the size limit and MIME list
-  above; there are zero policies on `storage.objects` that reference `media`; and, with one object row present
+  above; there are **zero policies on `storage.objects` in v0** (`select count(*) from pg_policies where
+  schemaname = 'storage' and tablename = 'objects'` = 0 — any policy, whatever its `bucket_id` filter, is a
+  contract change); and, with one object row present
   for `bucket_id = 'media'` (inserted as owner), `anon` / `authenticated` `select` returns **zero rows** and
   `insert` / `update` / `delete` change nothing or fail with `42501`. (Unlike the `public` tables, the
   migration does not revoke Supabase's own grants on `storage.objects` — RLS is what denies here.)
 - The receiver downloads media **only from Meta CDN hosts** (allowlist owned by `receiver-engineer`,
-  e.g. `lookaside.fbsbx.com`, `*.cdninstagram.com`, `*.fbcdn.net`) — SSRF guard.
+  e.g. `lookaside.fbsbx.com`, `*.cdninstagram.com`, `*.fbcdn.net`) — SSRF guard. The exact normative SSRF
+  rules (https and port 443 only, exact host or `.`-suffix match, no IP literals or userinfo, redirects
+  re-checked per hop or not followed, streamed 50 MiB cap, timeouts, no auth headers to the CDN) are added
+  here before M2 starts.
 
 ## 4. Lifecycle
 
 | When | Actor | Action |
 |---|---|---|
 | Right after a **new** row is inserted (`returning id` gave a row; duplicates copy nothing) | `ig-webhook`, inside `EdgeRuntime.waitUntil(...)` after responding `200` | Download each attachment URL (one retry per attachment), upload to `{post_id}/NN.ext`. If **≥ 1** object stored → set `media_path = '{post_id}/'`. If some failed → also `error = 'media_copy_partial'`; if all failed → `media_path` stays `null`, `error = 'media_copy_failed'`. `error` never contains the URL |
-| Worker processes the post | worker (`analyze/media.py` via `db/storage.py`) | Download objects under `media_path` to a local temp dir; delete the temp dir when the post is finished (any outcome) |
-| Post reaches `done` or `needs_review` | worker | **After** the result row is committed: delete all objects under `media_path`, then set `media_path = null` |
+| Worker processes the post | worker (`analyze/media.py` via `db/storage.py`) | List objects under `media_path` and download them to a local temp dir; delete the temp dir when the post is finished (any outcome). **No media** = `media_path` is `null` **or** the listing under it is empty; an object that is listed but "not found" on download counts as absent. No media is not an error: the cascade reuses stored vision or skips Stages 2–3 (interfaces.md §6) |
+| Post reaches `done` or `needs_review` | worker | **After** the result row is committed: delete all objects under `media_path` ("not found" is success), then `update posts set media_path = null where id = $1 and status in ('done','needs_review') and media_path is not null` ([schema.md §3](schema.md#3-postsstatus-state-machine) write conditions) |
 | Post reaches `failed` | worker | **Keep** the media, so `retry` can re-run vision |
-| Each worker run, after the batch loop | worker | **Cleanup sweep:** for rows with `status in ('done','needs_review') and media_path is not null`, delete objects and null `media_path` (catches deletes that failed earlier). Idempotent; "not found" is success |
+| Each worker run, after the batch loop | worker | **Cleanup sweep:** for rows with `status in ('done','needs_review') and media_path is not null`, delete objects, then null `media_path` with the same conditional update as above (catches deletes that failed earlier). Idempotent; "not found" is success |
 | `DELETE /api/posts/{id}` | local API | Delete all objects under `{id}/` first ("not found" is success), then delete the row. If Storage errors, the row is kept and the API returns `502` |
 
 Consequences:
 - Steady-state storage ≈ media of posts still `received`/`analyzing`/`failed` → stays far inside the 1 GB free tier.
 - Retrying a `done`/`needs_review` post finds no media; the cascade reuses the vision outputs already in
   `posts.evidence` (see [interfaces.md §6](interfaces.md#evidence-json-postsevidence)) instead of re-calling vision.
-- Orphaned folders (a row deleted by hand in the dashboard) are not swept in v0; acceptable at this volume.
+- A retry that lands between the result commit and the cleanup leaves `media_path` set on a `received` row
+  whose objects are (or are about to be) gone. That is the "no media" case above, not a failure.
+- Orphaned folders are not swept in v0; acceptable at this volume. They arise when a row is deleted by hand in
+  the dashboard, or when `DELETE /api/posts/{id}` runs while the receiver's `waitUntil` upload for that post
+  is still in progress.
 
 ## 5. Errors
 
@@ -91,7 +100,8 @@ Consequences:
 |---|---|
 | Upload exceeds the bucket size limit | counts as a failed attachment (`media_copy_partial` / `media_copy_failed`) |
 | CDN URL expired / non-2xx / host not in allowlist | failed attachment; never retried after the one retry |
-| Worker can't download an object listed under `media_path` | post → `failed`, `error = 'media_download_failed'`; media kept |
+| Worker can't download an object listed under `media_path` (any error except "not found") | post → `failed`, `error = 'media_download_failed'`; media kept |
+| Listing under `media_path` is empty, or every listed object is "not found" | no media (§4) — not an error |
 | Delete fails during cleanup | leave `media_path` set; the next run's sweep retries |
 
 ## 6. Open questions
