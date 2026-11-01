@@ -33,3 +33,4 @@ for f in "$ROOT"/.claude/agents/*.md; do
 done
 
 label "security" "d93f0b" "Crosses the trust boundary; needs agent-review/security"
+# scratch
