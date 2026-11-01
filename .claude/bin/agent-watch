@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Live view of the agent activity feed written by .claude/hooks/agent-feed.py.
 #
-#   agent-watch            tail .claude/logs/agents/all.log, one color per agent
+#   agent-watch            live status dashboard: one row per agent, redrawn in place
+#   agent-watch log        tail .claude/logs/agents/all.log instead, one color per agent
 #   agent-watch <agent>    tail that agent's own log
 #   agent-watch handoffs   list the 10 newest handoffs, show the latest
 #   agent-watch prs        poll `gh pr list` + `git worktree list` every 30s
@@ -28,6 +29,9 @@ colorize() {
 
 case "${1:-}" in
   "")
+    exec python3 "$root/.claude/bin/agent-dashboard.py" "$root"
+    ;;
+  log)
     touch "$log_dir/all.log"
     tail -F -n 100 "$log_dir/all.log" | colorize
     ;;

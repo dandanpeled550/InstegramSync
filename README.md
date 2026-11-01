@@ -40,10 +40,14 @@ Every sub-agent writes a line per tool call to `.claude/logs/agents/<agent>.log`
 | Pane | Command | Shows |
 |---|---|---|
 | Main | `claude --agent tech-lead` | the orchestrator you're driving |
-| Split (`Cmd+D`) | `.claude/bin/agent-watch` | every agent's activity, one color each |
+| Split (`Cmd+D`) | `.claude/bin/agent-watch` | live status dashboard: one row per agent, redrawn in place |
 | Split (`Cmd+Shift+D`) | `.claude/bin/agent-watch prs` | open PRs + checks, refreshed every 30s |
-| Extra split per agent | `.claude/bin/agent-watch <agent>` | e.g. `agent-watch pipeline-engineer` |
+| Extra split per agent | `.claude/bin/agent-watch <agent>` | raw tail of one agent's log, e.g. `agent-watch pipeline-engineer` |
 
+`agent-watch`'s default view answers "what is each sub-agent doing right now" at a glance — one row
+per agent (from `.claude/agents/*.md`), each showing its current status (`●` running, `✓` idle,
+`—` not started), its last action, and how long it's been in that state; running agents sort to the
+top. For the old scrolling, color-per-agent tail across every agent, use `agent-watch log`.
 `.claude/bin/agent-watch handoffs` lists the 10 newest handoff reports and prints the latest in full —
 useful right after a builder finishes, before you decide what to review next.
 
