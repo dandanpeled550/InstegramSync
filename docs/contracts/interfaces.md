@@ -1,6 +1,7 @@
 # Interfaces contract — v0
 
-- Version: v0 (M0.1) · 2026-11-01 · owner: `architect`
+- Version: v0.1 (M0.1b) · 2026-11-01 · owner: `architect` — v0.1: `PERMALINK_RE.fullmatch`, no `RUBRIC`
+  default, `no_evidence` ⇔ empty `stages`, partial listing = no media
 - Source: [PLAN.md §2–§5](../PLAN.md), [ADR 0002](../decisions/0002-staged-cascade-with-jev.md).
 - The Python below is the **contract** (names, fields, types, docstrings, error behavior). Builders implement
   it in the modules named; bodies shown as `...` are theirs to write.
@@ -60,6 +61,7 @@ class Post:
     holds the previous run's values); the worker fills them from `parse(raw_payload)`
     (`dataclasses.replace(post, kind=..., ...)`).
     """
+
     id: UUID
     message_mid: str
     sender_id: str
@@ -67,8 +69,9 @@ class Post:
     raw_payload: Mapping[str, Any]
     created_at: datetime
     claimed_at: datetime | None
-    media_path: str | None                 # "{id}/" or None — storage.md §2
-    evidence: Mapping[str, Any] | None     # previous run's evidence JSON (non-None on retry)
+    media_path: str | None  # "{id}/" or None — storage.md §2
+    # previous run's evidence JSON (non-None on retry)
+    evidence: Mapping[str, Any] | None
     kind: PostKind | None = None
     ig_media_id: str | None = None
     permalink: str | None = None
@@ -77,19 +80,24 @@ class Post:
 
 ```python
 # backend/app/ingest/parser.py
-PERMALINK_RE: re.Pattern[str] = re.compile(r"^https://www\.instagram\.com/(p|reel)/[A-Za-z0-9_-]+/?$")
-# Widening it (e.g. after the M1 spike) is a contract change. The SPA applies the same check before
-# rendering a permalink as a link (api.md).
+PERMALINK_RE: re.Pattern[str] = re.compile(
+    r"^https://www\.instagram\.com/(p|reel)/[A-Za-z0-9_-]+/?$"
+)
+# Always applied with PERMALINK_RE.fullmatch(value) — never .match()/.search(), because `$` also matches
+# before a trailing "\n". Widening it (e.g. after the M1 spike) is a contract change. The SPA applies the
+# same check before rendering a permalink as a link (api.md), with a regex that has no `m` flag.
 
 
 @dataclass(frozen=True, slots=True)
 class ParsedPayload:
     """Typed fields extracted from one webhook `messaging` event. All payload knowledge lives in parser.py."""
+
     kind: PostKind
     ig_media_id: str | None
-    permalink: str | None        # None unless it fully matches PERMALINK_RE — derivation verified in M1
-    caption: str | None          # as found; no cleaning
-    attachment_count: int        # >= 1
+    # None unless it fully matches PERMALINK_RE — derivation verified in M1
+    permalink: str | None
+    caption: str | None  # as found; no cleaning
+    attachment_count: int  # >= 1
 
 
 class UnsupportedPayload(ValueError):
@@ -98,6 +106,7 @@ class UnsupportedPayload(ValueError):
     `reason` is a short machine-readable code, e.g. "no_attachment", "unsupported_type".
     The worker marks the post `failed` with error f"unsupported_payload: {reason}".
     """
+
     reason: str
 
 
@@ -113,16 +122,18 @@ def parse(raw_payload: Mapping[str, Any]) -> ParsedPayload:
 @dataclass(frozen=True, slots=True)
 class Category:
     """A row of `categories`. Loaded once per worker run and passed to adapters' constructors."""
+
     id: int
-    slug: str     # "food"
-    label: str    # "Food"
+    slug: str  # "food"
+    label: str  # "Food"
 
 
 @dataclass(frozen=True, slots=True)
 class Usage:
     """Cost/latency record for one model call; stored in evidence for evals."""
-    provider: str                  # "jev" | "gemini" | ...
-    model: str                     # e.g. "gemini-2.5-flash"
+
+    provider: str  # "jev" | "gemini" | ...
+    model: str  # e.g. "gemini-2.5-flash"
     input_tokens: int | None = None
     output_tokens: int | None = None
     cost_usd: float | None = None
@@ -136,19 +147,21 @@ class StageDecision:
     Invariants (checked in __post_init__, ValueError on violation):
       0.0 <= confidence <= 1.0;  0 <= informativeness <= 3;  category non-empty.
     """
-    category: str           # a Category.slug — the decider's best choice
-    confidence: float       # confidence in `category`
-    relevant: bool          # is the text about this post (not promo / CTA / giveaway)?
-    informativeness: int    # rubric score 0–3 for `category` (PLAN §3 table)
+
+    category: str  # a Category.slug — the decider's best choice
+    confidence: float  # confidence in `category`
+    relevant: bool  # is the text about this post (not promo / CTA / giveaway)?
+    informativeness: int  # rubric score 0–3 for `category` (PLAN §3 table)
     usage: Usage | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class MediaItem:
     """One stored attachment, downloaded by the pipeline to a local temp file before vision runs."""
-    index: int                          # 0-based attachment order (storage.md §2)
-    path: Path                          # local file; deleted by the pipeline after the post finishes
-    mime_type: str                      # "image/jpeg", "video/mp4", ...
+
+    index: int  # 0-based attachment order (storage.md §2)
+    path: Path  # local file; deleted by the pipeline after the post finishes
+    mime_type: str  # "image/jpeg", "video/mp4", ...
     kind: Literal["image", "video"]
 
 
@@ -159,12 +172,13 @@ class VisionResult:
     Text fields are None when absent (never ""). `transcript` is only produced in mode="full" for video.
     `suggested_category` is a Category.slug or None when the model can't tell.
     """
+
     description: str
     on_screen_text: str | None = None
     transcript: str | None = None
     dish_or_place: str | None = None
     location_hint: str | None = None
-    language: str | None = None          # BCP-47 primary tag, e.g. "he", "en"
+    language: str | None = None  # BCP-47 primary tag, e.g. "he", "en"
     suggested_category: str | None = None
     usage: Usage | None = None
 
@@ -177,9 +191,13 @@ class ModelError(Exception):
     "timeout after 3 attempts") and is stored in `posts.error` (schema.md §3.1): it never contains API
     keys, signed URLs, model output or post content.
     """
+
     retryable: bool
 
+
 class DeciderError(ModelError): ...
+
+
 class VisionError(ModelError): ...
 ```
 
@@ -236,20 +254,23 @@ and thresholds in `decide/policy.py`. This contract puts all three in `decide/po
 a pure function, which the cascade (pipeline-engineer) calls.
 
 ```python
-RUBRIC: Mapping[str, Mapping[int, str]]  # category slug → score 0–3 → criterion text (PLAN §3 table);
-                                         # used by JevDecider's informativeness question
+# category slug → score 0–3 → criterion text (PLAN §3 table); used by JevDecider's informativeness
+# question. No default: JevDecider.__init__ raises ValueError if a loaded category has no RUBRIC entry,
+# so run_worker fails before claiming anything (a config error, not a per-post failure).
+# tests/ai asserts RUBRIC covers the slugs in schema.md §2.1.
+RUBRIC: Mapping[str, Mapping[int, str]]
 CATEGORY_CONFIDENCE_MIN: float = 0.8
 REQUIRED_INFO: Mapping[str, int] = {"food": 3, "travel": 2}
-REQUIRED_INFO_DEFAULT: int = 3          # for a category slug missing from REQUIRED_INFO
+REQUIRED_INFO_DEFAULT: int = 3  # for a category slug missing from REQUIRED_INFO
 PEEK_SECONDS: int = 10
 
 
 def should_stop(decision: StageDecision, evidence: Evidence) -> bool:
     """Pure. True iff the cascade can stop at the current stage:
-        decision.confidence >= CATEGORY_CONFIDENCE_MIN
-        and decision.relevant
-        and decision.informativeness >= REQUIRED_INFO.get(decision.category, REQUIRED_INFO_DEFAULT)
-        and evidence.suggested_category in (None, decision.category)     # vision cross-check
+    decision.confidence >= CATEGORY_CONFIDENCE_MIN
+    and decision.relevant
+    and decision.informativeness >= REQUIRED_INFO.get(decision.category, REQUIRED_INFO_DEFAULT)
+    and evidence.suggested_category in (None, decision.category)     # vision cross-check
     """
 ```
 
@@ -257,17 +278,18 @@ def should_stop(decision: StageDecision, evidence: Evidence) -> bool:
 
 ```python
 StageName = Literal["caption", "peek", "full"]
-StageNumber = Literal[1, 2, 3]          # Stage 0 (pre-check) is not recorded as a stage
+StageNumber = Literal[1, 2, 3]  # Stage 0 (pre-check) is not recorded as a stage
 ReviewReason = Literal["below_threshold", "cross_check_mismatch", "no_evidence"]
 
 
 @dataclass(frozen=True, slots=True)
 class StageRecord:
     stage: StageNumber
-    name: StageName                       # 1="caption", 2="peek", 3="full"
-    vision: VisionResult | None           # None for stage 1
-    decision: StageDecision | None        # None until decide() returned
-    reused: bool = False                  # vision copied from the previous run's evidence (retry, media gone)
+    name: StageName  # 1="caption", 2="peek", 3="full"
+    vision: VisionResult | None  # None for stage 1
+    decision: StageDecision | None  # None until decide() returned
+    # vision copied from the previous run's evidence (retry, media gone)
+    reused: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,25 +299,33 @@ class Evidence:
     caption: raw caption (or None). clean_caption: after Stage 0 pre-check (hashtags/emojis/@mentions
     stripped); None when the pre-check decided the caption is too short (< ~15 chars) → Stage 1 skipped.
     """
+
     caption: str | None
     clean_caption: str | None
     stages: tuple[StageRecord, ...] = ()
 
-    def with_vision(self, stage: StageNumber, vision: VisionResult | None, *, reused: bool = False) -> "Evidence":
+    def with_vision(
+        self, stage: StageNumber, vision: VisionResult | None, *, reused: bool = False
+    ) -> "Evidence":
         """Append a new StageRecord (name derived from `stage`). Stages must be strictly increasing."""
+
     def with_decision(self, decision: StageDecision) -> "Evidence":
         """Attach `decision` to the last StageRecord. ValueError if there is none or it already has one."""
+
     @property
     def suggested_category(self) -> str | None:
         """suggested_category of the most recent stage that has vision; None if no vision yet."""
+
     @property
     def latest_decision(self) -> StageDecision | None: ...
     def as_text(self) -> str:
         """Deterministic plain-text rendering of all evidence (caption + every stage's vision fields),
         labeled by source. Adapters may use it or their own delimited rendering."""
+
     def to_json(self) -> dict[str, Any]:
         """The `caption`/`clean_caption`/`stages` part of the evidence JSON below (version 1).
         Generic: built with `dataclasses.asdict` (tuples become lists, None becomes null) — no per-field code."""
+
     @classmethod
     def from_json(cls, data: Mapping[str, Any]) -> "Evidence":
         """Inverse of to_json; ValueError on unknown `version`. Generic: each nested dataclass
@@ -309,9 +339,10 @@ class CascadeResult:
     """Outcome of run_cascade(post). Invariants:
       needs_review is False ⇒ decision is not None, decided_at_stage is not None, review_reason is None
       needs_review is True  ⇒ review_reason is not None
-      review_reason == "no_evidence" ⇔ decision is None (no stage could run)
+      review_reason == "no_evidence" ⇔ decision is None ⇔ evidence.stages == () (no stage could run)
     decision / decided_at_stage are those of the LAST stage that ran.
     """
+
     decision: StageDecision | None
     evidence: Evidence
     decided_at_stage: StageNumber | None
@@ -327,8 +358,8 @@ stored earlier still loads.
 `suggested_category` disagrees with its decision, otherwise `below_threshold`. A single photo whose peek
 doesn't stop is `below_threshold` (Stage 3 doesn't apply to it).
 
-**Retry with media gone:** if the post has no stored media (`media_path` is `None`, or the listing under it
-is empty — storage.md §4) and `post.evidence` holds vision for stage 2/3, the cascade reuses it
+**Retry with media gone:** if the post has no stored media (`media_path` is `None`, the listing under it
+is empty, or any listed object is "not found" — storage.md §4) and `post.evidence` holds vision for stage 2/3, the cascade reuses it
 (`with_vision(..., reused=True)`) instead of calling `VisionModel`; decisions are always recomputed. With neither media nor stored vision, stages 2–3 are skipped.
 
 **Errors:** `DeciderError` / `VisionError` propagate out of the cascade; the worker marks the post `failed`
@@ -380,7 +411,7 @@ Field rules: unknown keys are ignored by readers; `version` bumps only on breaki
 ## 7. Titles — `enrich/title.py`
 
 ```python
-TITLE_MAX_CHARS: int = 60     # also enforced by posts_title_length_check
+TITLE_MAX_CHARS: int = 60  # also enforced by posts_title_length_check
 
 
 class Titler(Protocol):
@@ -411,12 +442,12 @@ re-implement the loop).
 ```python
 @dataclass(frozen=True, slots=True)
 class RunSummary:
-    recovered: int        # rows moved analyzing → received at start
+    recovered: int  # rows moved analyzing → received at start
     claimed: int
     done: int
     needs_review: int
     failed: int
-    dropped: int          # results discarded because the row changed meanwhile (schema.md §3)
+    dropped: int  # results discarded because the row changed meanwhile (schema.md §3)
     started_at: datetime
     finished_at: datetime
 

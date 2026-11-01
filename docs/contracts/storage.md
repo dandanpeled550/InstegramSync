@@ -1,6 +1,7 @@
 # Storage contract — v0
 
-- Version: v0 (M0.1) · 2026-11-01 · owner: `architect`
+- Version: v0.1 (M0.1b) · 2026-11-01 · owner: `architect` — v0.1: single conditional receiver media write,
+  partial listing = no media
 - Implemented by: `data-engineer` (bucket in the migration, `backend/app/db/storage.py`), `receiver-engineer`
   (upload), `pipeline-engineer` (download + cleanup), `web-engineer` (delete via API).
 - Source: [PLAN.md §1, §2, §6](../PLAN.md), [ADR 0001](../decisions/0001-supabase-receiver-laptop-worker.md).
@@ -77,8 +78,8 @@ media/6f1c2a9e-0b7d-4e3a-9a51-2d4c8e7f1a00/02.jpg
 
 | When | Actor | Action |
 |---|---|---|
-| Right after a **new** row is inserted (`returning id` gave a row; duplicates copy nothing) | `ig-webhook`, inside `EdgeRuntime.waitUntil(...)` after responding `200` | Download each attachment URL (one retry per attachment), upload to `{post_id}/NN.ext`. If **≥ 1** object stored → set `media_path = '{post_id}/'`. If some failed → also `error = 'media_copy_partial'`; if all failed → `media_path` stays `null`, `error = 'media_copy_failed'`. `error` never contains the URL |
-| Worker processes the post | worker (`analyze/media.py` via `db/storage.py`) | List objects under `media_path` and download them to a local temp dir; delete the temp dir when the post is finished (any outcome). **No media** = `media_path` is `null` **or** the listing under it is empty; an object that is listed but "not found" on download counts as absent. No media is not an error: the cascade reuses stored vision or skips Stages 2–3 (interfaces.md §6) |
+| Right after a **new** row is inserted (`returning id` gave a row; duplicates copy nothing) | `ig-webhook`, inside `EdgeRuntime.waitUntil(...)` after responding `200` | Download each attachment URL (one retry per attachment), upload to `{post_id}/NN.ext`. When every attachment has been attempted, **one** conditional update sets `media_path` and `error` together ([schema.md §3](schema.md#3-postsstatus-state-machine), receiver media write; [receiver.md §6](receiver.md#6-insert-and-dedupe)): **≥ 1** object stored → `media_path = '{post_id}/'`, plus `error = 'media_copy_partial'` if some failed; all failed → `media_path` stays `null`, `error = 'media_copy_failed'`. Never one update per attachment. `error` never contains the URL |
+| Worker processes the post | worker (`analyze/media.py` via `db/storage.py`) | List objects under `media_path` and download them to a local temp dir; delete the temp dir when the post is finished (any outcome). **No media** = `media_path` is `null`, **or** the listing under it is empty, **or** any listed object is "not found" on download. In the last case the whole post counts as having no media (all downloaded files are discarded), because a partial set means a cleanup is deleting it — running vision on part of the media would overwrite the full stored vision. No media is not an error: the cascade reuses stored vision or skips Stages 2–3 (interfaces.md §6) |
 | Post reaches `done` or `needs_review` | worker | **After** the result row is committed: delete all objects under `media_path` ("not found" is success), then `update posts set media_path = null where id = $1 and status in ('done','needs_review') and media_path is not null` ([schema.md §3](schema.md#3-postsstatus-state-machine) write conditions) |
 | Post reaches `failed` | worker | **Keep** the media, so `retry` can re-run vision |
 | Each worker run, after the batch loop | worker | **Cleanup sweep:** for rows with `status in ('done','needs_review') and media_path is not null`, delete objects, then null `media_path` with the same conditional update as above (catches deletes that failed earlier). Idempotent; "not found" is success |
@@ -91,8 +92,10 @@ Consequences:
 - A retry that lands between the result commit and the cleanup leaves `media_path` set on a `received` row
   whose objects are (or are about to be) gone. That is the "no media" case above, not a failure.
 - Orphaned folders are not swept in v0; acceptable at this volume. They arise when a row is deleted by hand in
-  the dashboard, or when `DELETE /api/posts/{id}` runs while the receiver's `waitUntil` upload for that post
-  is still in progress.
+  the dashboard; when `DELETE /api/posts/{id}` runs while the receiver's `waitUntil` upload for that post
+  is still in progress (the receiver media write then updates zero rows); or when the Edge Function instance
+  hits a platform limit mid-upload, so the final media write never runs (`media_path` stays `null` and the
+  worker processes the post caption-only after `MEDIA_WAIT_MINUTES`).
 
 ## 5. Errors
 
@@ -101,7 +104,7 @@ Consequences:
 | Upload exceeds the bucket size limit | counts as a failed attachment (`media_copy_partial` / `media_copy_failed`) |
 | CDN URL expired / non-2xx / host not in allowlist | failed attachment; never retried after the one retry |
 | Worker can't download an object listed under `media_path` (any error except "not found") | post → `failed`, `error = 'media_download_failed'`; media kept |
-| Listing under `media_path` is empty, or every listed object is "not found" | no media (§4) — not an error |
+| Listing under `media_path` is empty, or any listed object is "not found" | no media for the whole post (§4) — not an error |
 | Delete fails during cleanup | leave `media_path` set; the next run's sweep retries |
 
 ## 6. Open questions

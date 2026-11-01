@@ -1,6 +1,7 @@
 # Schema contract — v0
 
-- Version: v0 (M0.1) · 2026-11-01 · owner: `architect`
+- Version: v0.1 (M0.1b) · 2026-11-01 · owner: `architect` — v0.1 adds the migration role guard, the owner and
+  extension checks, the receiver media write and the exact PATCH statement (follow-ups from the PR #4 reviews)
 - Mirrors: `supabase/migrations/` (implemented by `data-engineer` in M0.5). Where this file and a migration
   disagree, the migration is a bug or this file needs an ADR — never silently "fix" one to match the other.
 - Source: [PLAN.md §6](../PLAN.md#6-store--supabase), [ADR 0001](../decisions/0001-supabase-receiver-laptop-worker.md).
@@ -14,6 +15,10 @@
 `gen_random_uuid()` is built into Postgres 13+; no `pgcrypto` needed. On Supabase, create extensions
 `with schema extensions` and reference the operator class as `extensions.gin_trgm_ops` if the migration's
 `search_path` does not include `extensions`. (`pg_cron` / `pg_net` arrive in M2 with their own migration.)
+
+**No extension lives in `public`.** Every `create extension` names `with schema extensions` (or the
+extension's own fixed schema). An extension in `public` would put RPC-callable functions on the PostgREST
+surface. `tests/db` asserts this (§5).
 
 ## 2. Tables
 
@@ -67,7 +72,7 @@ One row per shared Instagram message. The table is also the work queue (see §3)
 | `status` | `text` | no | `'received'` | all | state machine, §3 |
 | `current_stage` | `smallint` | yes | — | worker | stage in progress while `analyzing` (0–3) |
 | `claimed_at` | `timestamptz` | yes | — | worker | set on claim; used for stuck-row recovery |
-| `error` | `text` | yes | — | receiver, worker | a fixed error code from §3.1 — never raw exception text, secrets, tokens, URLs or post content; ≤ 500 chars |
+| `error` | `text` | yes | — | receiver, worker | exactly one of the §3.1 forms — never raw exception text, secrets, tokens, URLs or post content; ≤ 500 chars |
 | `raw_payload` | `jsonb` | no | — | receiver | the webhook `messaging` event exactly as received (shape: `payloads.md`, M1) |
 | `created_at` | `timestamptz` | no | `now()` | DB | time the receiver stored the row |
 | `search_tsv` | `tsvector` | — | generated | DB | `generated always as (to_tsvector('simple', coalesce(title,'') \|\| ' ' \|\| coalesce(search_text,''))) stored` |
@@ -137,11 +142,12 @@ relevant, informativeness, decided_at_stage, evidence`.
 | From | To | Actor | Exact write |
 |---|---|---|---|
 | — | `received` | receiver | `insert (message_mid, sender_id, raw_payload) … on conflict (message_mid) do nothing returning id` |
+| `received` | `received` | receiver media write (M2, [receiver.md §6](receiver.md#6-insert-and-dedupe)) | once per new row, after all attachments were attempted: `media_path` and `error` **in one update** — `('{id}/', null)`, `('{id}/', 'media_copy_partial')` or `(null, 'media_copy_failed')` |
 | `received` | `analyzing` | worker claim | `status='analyzing', current_stage=0, claimed_at=now()` — see claim query below (`error` is left as-is so a receiver `media_copy_*` code stays visible until the result is written) |
 | `analyzing` | `received` | worker recover | rows with `claimed_at < now() - interval '30 minutes'`: `status='received', current_stage=null, claimed_at=null` |
 | `analyzing` | `done` / `needs_review` | worker | result columns + `current_stage=coalesce(decided_at_stage, 0), error=null`; then media cleanup ([storage.md §4](storage.md#4-lifecycle)) |
 | `analyzing` | `failed` | worker | `status='failed', error=<code from §3.1>`; `current_stage` left as-is (shows where it failed); media kept |
-| `needs_review` / `done` | `done` | API `PATCH /api/posts/{id}` | `category_id=<chosen>, status='done'`; in `evidence`: set `needs_review=false`, `review_reason=null`, and **set** (overwrite, not append) `manual_override` (interfaces.md §6) |
+| `needs_review` / `done` | `done` | API `PATCH /api/posts/{id}` | `category_id=<chosen>, status='done'`; in `evidence`: set `needs_review=false`, `review_reason=null`, and **set** (overwrite, not append) `manual_override` (interfaces.md §6) — exact statement below |
 | `done` / `needs_review` / `failed` | `received` | API `POST /api/posts/{id}/retry` | `status='received', current_stage=null, claimed_at=null, error=null` (result columns kept until overwritten) |
 | any | (row deleted) | API `DELETE /api/posts/{id}` | delete Storage objects, then `delete from posts where id=$1` |
 
@@ -149,6 +155,7 @@ relevant, informativeness, decided_at_stage, evidence`.
 
 | Write | `where` condition | Zero rows updated means |
 |---|---|---|
+| receiver media write (M2) | `update posts set media_path=$2, error=$3 where id=$1 and status='received'` | the row was deleted (or, if the timing rule below were ever broken, already claimed) → the receiver leaves the stored objects (orphans, storage.md §4) and does not retry |
 | claim | the claim query below | nothing to claim |
 | recover | `status='analyzing' and claimed_at < now() - interval '30 minutes'` | nothing stuck |
 | result (`done` / `needs_review`) and `failed` | `id=$1 and status='analyzing' and claimed_at=$claimed_at` | the row was recovered, retried or deleted meanwhile → the worker drops its result (logs `id` only), counts it in `RunSummary.dropped`, sends no DM |
@@ -161,6 +168,43 @@ This makes overlapping runs (CLI + "Process now") and API actions during a run s
 it is sent only after a result write updated exactly 1 row (its text for `needs_review` is fixed in the M4
 contract update).
 
+**Why the receiver media write can't race the worker.** The claim takes a row whose `media_path` is still
+`null` only once `created_at < now() - MEDIA_WAIT_MINUTES`. The receiver's background work runs inside the
+Edge Function's wall-clock window, which starts before the insert (so before `created_at`) and ends at most
+150 s later on the Free plan (400 s on paid plans — [research](../research/supabase-edge-functions.md)).
+With `MEDIA_WAIT_MINUTES = 5` (300 s), the media write always lands before the worker may claim a media-less
+row. A row with `media_path` set can be claimed at once, but `media_path` is set only by this single, final
+write; the receiver writes nothing to the row after it. Rule: **`MEDIA_WAIT_MINUTES × 60` must exceed the
+wall-clock limit of the plan in use.** `config.py` rejects `MEDIA_WAIT_MINUTES < 3` (Free plan); moving to a
+paid plan raises the minimum to 7 (contract update). The `status='received'` condition is the second line of
+defence: if the timing assumption ever breaks, the write updates zero rows instead of putting an `error` on a
+`done` row or overwriting a `failed` code.
+
+**PATCH statement** (`PATCH /api/posts/{id}`). It is one statement, so `previous_category` and
+`previous_review_reason` describe exactly the row version that was updated (never read-then-write). `$1` is
+the post id, `$2` the chosen slug (already validated by the API, `422` otherwise):
+
+```sql
+update posts p
+   set category_id = c.id,
+       status      = 'done',
+       evidence    = p.evidence || jsonb_build_object(
+         'needs_review',    false,
+         'review_reason',   null,
+         'manual_override', jsonb_build_object(
+           'category',               c.slug,
+           'previous_category',      (select pc.slug from categories pc where pc.id = p.category_id),
+           'previous_review_reason', p.evidence -> 'review_reason',
+           'at', to_char(now() at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')))
+  from categories c
+ where p.id = $1 and c.slug = $2 and p.status in ('done', 'needs_review')
+returning p.*;
+```
+
+`set` expressions see the row as it was before the update. A second PATCH on a `done` row records
+`previous_review_reason = null`. That the post was originally `no_evidence` stays visible because
+`evidence.stages` is empty (see the invariants below).
+
 **Per-status invariants** (true for every row, whoever wrote it). "—" = unspecified: `null` on a fresh row,
 the previous run's values after a retry (kept until overwritten). Readers must not treat "—" values as the
 current result — the one deliberate use is the worker reading the previous `evidence` on a retry to reuse
@@ -170,11 +214,12 @@ stored vision (interfaces.md §6).
 |---|---|---|---|---|---|---|---|
 | `received` | — | — | — | — | `null` | `null` | `null` or `media_copy_*` |
 | `analyzing` | — | — | — | — | 0–3 | not null | `null` or `media_copy_*` |
-| `done` | **not null** | not null — except all four `null` when `evidence.manual_override` is set and the overridden result was `no_evidence` | not null, `needs_review=false` | `null` | 0–3 | last claim | `null` |
-| `needs_review` | not null — `null` iff `review_reason='no_evidence'` | not null — all four `null` iff `review_reason='no_evidence'` | not null, `needs_review=true` | **not null** | 0–3 | last claim | `null` |
+| `done` | **not null** | all four not null, **or** all four `null` — allowed only if `evidence.stages` is empty **and** `evidence.manual_override` is not null (a former `no_evidence` row the owner categorized) | not null, `needs_review=false` | `null` | 0–3 | last claim | `null` |
+| `needs_review` | not null — `null` iff `review_reason='no_evidence'` | all four not null, or all four `null` iff `review_reason='no_evidence'` iff `evidence.stages` is empty | not null, `needs_review=true` | **not null** | 0–3 | last claim | `null` |
 | `failed` | — | — | — | — | stage where it failed (0–3) | last claim | **not null**, a §3.1 code |
 
-`no_evidence` = no stage could run (no usable caption and no media, nor stored vision). Also:
+`no_evidence` = no stage could run (no usable caption and no media, nor stored vision), so `evidence.stages`
+is empty. Every invariant can be checked from the row alone. Also:
 - No transition skips `analyzing` except the API transitions listed above.
 - Nothing ever writes `status='analyzing'` except the claim.
 
@@ -213,7 +258,8 @@ The `media_path is not null or created_at < now() - 5 min` condition gives the r
 copy time to finish before a fast "Process now" claims the row. After 5 minutes a row with no media is
 processed caption-only (download failed, or nothing to download). The 5 minutes and batch size 5 are
 `config.py` settings (`MEDIA_WAIT_MINUTES`, `CLAIM_BATCH_SIZE`), the 30 minutes is `STUCK_AFTER_MINUTES`.
-Keep `CLAIM_BATCH_SIZE × worst-case time per post` (a Stage 3 reel: a few minutes) well under
+`MEDIA_WAIT_MINUTES` must exceed the Edge Function wall-clock limit (see "Why the receiver media write can't
+race the worker" above). Keep `CLAIM_BATCH_SIZE × worst-case time per post` (a Stage 3 reel: a few minutes) well under
 `STUCK_AFTER_MINUTES`; otherwise a second run recovers rows the first run has claimed but not reached yet.
 The conditional writes keep that correct, but it pays for the model calls twice.
 
@@ -245,7 +291,8 @@ system talks to Postgres as `anon` or `authenticated` — the browser only talks
 
 Defense in depth — Supabase's default privileges grant table, sequence and function rights to
 `anon`/`authenticated` on every new object in `public`, and Postgres grants `EXECUTE` on new functions to
-`PUBLIC`. The initial migration therefore runs:
+`PUBLIC`. These revokes cover only objects **owned by `postgres`**, so every migration first checks that it
+runs as `postgres` (§6, migration role guard). The initial migration then runs:
 
 ```sql
 -- existing objects
@@ -260,6 +307,11 @@ alter default privileges for role postgres in schema public revoke all on functi
 alter default privileges for role postgres revoke execute on functions from public;  -- global: a per-schema
                                                                                       -- entry can't remove it
 ```
+
+The last statement is **global**. It removes the `PUBLIC` `EXECUTE` default from every function `postgres`
+creates later, in any schema, not only `public`. A later migration whose function must be callable by some
+role (e.g. M2's pg_cron / pg_net helpers) grants `EXECUTE` explicitly to exactly that role, and never to
+`anon`, `authenticated` or `PUBLIC` in `public`.
 
 Rules for every later migration (also in §6):
 - A new table gets `enable row level security` and `revoke all … from anon, authenticated` **in the same
@@ -280,8 +332,15 @@ instead of a fixed list, so an object added later without RLS or revokes fails t
 - For every view in `public`: `reloptions` contains `security_invoker=true`.
 - For every sequence in `public`: `has_sequence_privilege(role, oid, 'USAGE,SELECT,UPDATE')` is false; and
   `select nextval('categories_id_seq')` as each role raises SQLSTATE `42501`.
-- For every function in `public` that is not an extension member (`pg_depend.deptype <> 'e'`):
-  `has_function_privilege(role, oid, 'EXECUTE')` is false.
+- For every function in `public`, with no exclusions: `has_function_privilege(role, oid, 'EXECUTE')` is
+  false.
+- No extension in `public`: `select count(*) from pg_extension where extnamespace = 'public'::regnamespace`
+  = 0. This replaces any "skip extension members" exclusion: an extension created without
+  `with schema extensions` fails here instead of being skipped. If a Supabase-installed extension ever shows
+  up in `public`, report it; never exclude it silently.
+- Every relation and function in `public` is owned by `postgres` (`pg_class.relowner` / `pg_proc.proowner`
+  = `'postgres'::regrole`), so the default-privilege revokes above apply to it.
+- Every file in `supabase/migrations/` starts with the migration role guard (§6), checked by a file scan.
 - **Future objects:** inside a rolled-back transaction, as `postgres`, create a throwaway table, sequence,
   function and view in `public`; each role has no privilege on any of them (proves the default privileges).
   And no `pg_default_acl` entry of `defaclrole = 'postgres'` (global or for `public`) grants anything to
@@ -295,6 +354,14 @@ instead of a fixed list, so an object added later without RLS or revokes fails t
 - As the owner/service role: an insert into `posts` with only `message_mid`, `sender_id`, `raw_payload` succeeds
   with `status='received'`, a duplicate `message_mid` with `on conflict do nothing` inserts nothing, and each
   named `check` constraint in §2.2 rejects one out-of-range value.
+
+**Remote check after every deploy.** Locally these tests run against `supabase db reset`. The read-only
+catalog assertions above (privileges, RLS, view options, function `EXECUTE`, `pg_default_acl`, policies,
+extensions, owners; not the throwaway-object probe or the per-CRUD role tests) also run against **staging**
+after every CI `db push`, and any finding fails the deploy. Production gets the same check after its deploy.
+devops-engineer implements this in M0.6 and reuses data-engineer's queries (e.g. a `tests/db` marker that
+targets the deployed database). It closes the gap where the remote migration role differs, gets Supabase's
+default grants, and the local tests still pass.
 
 Adding a policy to any table later is a contract change (ADR + update to this table + a test for exactly
 that policy). Storage RLS is specified in [storage.md §3](storage.md#3-access).
@@ -312,9 +379,29 @@ staging/production are migrated by CI only ([AGENTS_PLAN §15.6](../AGENTS_PLAN.
 3. **Contract** — only in a later release, once no deployed code reads the old shape: drop old columns,
    narrow constraints. Drops and other destructive SQL need an ADR and human approval.
 
+**Migration role guard.** This is the first statement of **every** migration file:
+
+```sql
+do $$
+begin
+  if current_user <> 'postgres' then
+    raise exception 'migrations must run as postgres (current_user is %)', current_user;
+  end if;
+end $$;
+```
+
+Why `current_user` and not `session_user`: new objects are owned by the current role, and default privileges
+are keyed on it. Expected behaviour (medium confidence; Supabase CLI behaviour, not re-checked against its
+docs here): local `supabase db reset` connects as `postgres`. Remote `supabase db push` either connects as
+`postgres` (`--db-url`), or, when linked, logs in with a temporary CLI login role and runs
+`set role postgres`. In every case `current_user = 'postgres'` while `session_user` may differ, so the guard
+passes. If this is wrong, the first staging `db push` fails loudly before it creates anything, which is the
+intended outcome. Report it. The fix is a contract change (e.g. add the default-privilege revokes for that
+role); removing the guard is never the fix.
+
 Also:
-- Every new table, view, sequence and function follows the §5 rules (RLS + revokes, `security_invoker`) in
-  the migration that creates it.
+- No extension in `public` (§1). Every new table, view, sequence and function follows the §5 rules (RLS +
+  revokes, `security_invoker`) in the migration that creates it.
 - Migrations are append-only. An applied migration is never edited; fix forward with a new one.
 - No renames in place (add new → migrate → drop old). No `not null` on an existing column without a default
   and a backfill first.
