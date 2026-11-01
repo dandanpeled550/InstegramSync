@@ -1,0 +1,51 @@
+# Secrets — never commit (public repo)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+supabase/.env
+supabase/functions/.env
+
+# Private data
+evals/private/
+fixtures/raw/
+*.mp4
+*.mov
+*.jpg
+*.jpeg
+*.png
+*.webp
+!docs/**/*.png
+
+# Claude Code local state
+.claude/settings.local.json
+.claude/logs/
+.claude/worktrees/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Node / frontend
+node_modules/
+frontend/dist/
+.vite/
+
+# Supabase local
+supabase/.temp/
+supabase/.branches/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json

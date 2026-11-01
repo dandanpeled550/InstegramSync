@@ -1,0 +1,78 @@
+{
+  "_comment": "Agent -> globs it may write. '**' spans directories, '*' doesn't, '!glob' carves out an exception. Paths no agent owns (.claude/**, CLAUDE.md, LICENSE) are human-only. Enforced by .claude/hooks/enforce-ownership.py.",
+  "tech-lead": [
+    "docs/tasks/**",
+    "docs/PLAN.md",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "architect": [
+    "docs/contracts/**",
+    "docs/decisions/**"
+  ],
+  "researcher": [
+    "docs/research/**"
+  ],
+  "receiver-engineer": [
+    "supabase/functions/**"
+  ],
+  "data-engineer": [
+    "supabase/migrations/**",
+    "supabase/seed.sql",
+    "backend/app/db/**",
+    "tests/db/**"
+  ],
+  "pipeline-engineer": [
+    "backend/app/__init__.py",
+    "backend/app/ingest/**",
+    "backend/app/analyze/**",
+    "!backend/app/analyze/vision.py",
+    "backend/app/enrich/**",
+    "!backend/app/enrich/title.py",
+    "backend/app/meta/**",
+    "backend/app/process.py",
+    "backend/app/config.py",
+    "tests/pipeline/**"
+  ],
+  "ai-engineer": [
+    "backend/app/decide/**",
+    "backend/app/analyze/vision.py",
+    "backend/app/enrich/title.py",
+    "prompts/**",
+    "evals/**",
+    "tests/ai/**"
+  ],
+  "web-engineer": [
+    "frontend/**",
+    "!frontend/package.json",
+    "backend/app/api/**",
+    "backend/app/serve.py",
+    "tests/api/**"
+  ],
+  "devops-engineer": [
+    ".github/**",
+    "scripts/**",
+    "!scripts/replay*",
+    "!scripts/scrub*",
+    "ops/**",
+    "Makefile",
+    ".env.example",
+    ".gitignore",
+    ".pre-commit-config.yaml",
+    "supabase/config.toml",
+    "backend/pyproject.toml",
+    "frontend/package.json",
+    "CONTRIBUTING.md",
+    "SECURITY.md"
+  ],
+  "test-engineer": [
+    "tests/integration/**",
+    "tests/e2e/**",
+    "tests/conftest.py",
+    "fixtures/**",
+    "scripts/replay*",
+    "scripts/scrub*"
+  ],
+  "code-reviewer": [],
+  "security-reviewer": []
+}

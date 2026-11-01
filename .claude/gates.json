@@ -1,0 +1,36 @@
+{
+  "_comment": "SubagentStop quality gates per agent (.claude/hooks/quality-gate.py). A check is skipped while its workdir / only_if_exists paths / required tools don't exist yet.",
+  "receiver-engineer": [
+    { "name": "deno fmt", "workdir": "supabase/functions", "requires": ["deno"], "run": "deno fmt --check" },
+    { "name": "deno lint", "workdir": "supabase/functions", "requires": ["deno"], "run": "deno lint" },
+    { "name": "deno test", "workdir": "supabase/functions", "requires": ["deno"], "run": "deno test --allow-all --permit-no-files" }
+  ],
+  "data-engineer": [
+    { "name": "migrations apply", "only_if_exists": ["supabase/migrations"], "requires": ["supabase", "docker"], "run": "supabase db reset", "timeout": 900 },
+    { "name": "repo tests", "only_if_exists": ["tests/db"], "requires": ["pytest"], "run": "pytest -q tests/db" }
+  ],
+  "pipeline-engineer": [
+    { "name": "ruff check", "only_if_exists": ["backend"], "requires": ["ruff"], "run": "ruff check backend" },
+    { "name": "ruff format", "only_if_exists": ["backend"], "requires": ["ruff"], "run": "ruff format --check backend" },
+    { "name": "mypy", "only_if_exists": ["backend/app"], "requires": ["mypy"], "run": "mypy backend/app" },
+    { "name": "pipeline tests", "only_if_exists": ["tests/pipeline"], "requires": ["pytest"], "run": "pytest -q tests/pipeline" }
+  ],
+  "ai-engineer": [
+    { "name": "ruff check", "only_if_exists": ["backend"], "requires": ["ruff"], "run": "ruff check backend evals" },
+    { "name": "mypy", "only_if_exists": ["backend/app"], "requires": ["mypy"], "run": "mypy backend/app" },
+    { "name": "ai tests", "only_if_exists": ["tests/ai"], "requires": ["pytest"], "run": "pytest -q tests/ai" }
+  ],
+  "web-engineer": [
+    { "name": "api tests", "only_if_exists": ["tests/api"], "requires": ["pytest"], "run": "pytest -q tests/api" },
+    { "name": "frontend lint", "workdir": "frontend", "only_if_exists": ["frontend/package.json"], "requires": ["npm"], "run": "npm run lint" },
+    { "name": "frontend typecheck", "workdir": "frontend", "only_if_exists": ["frontend/package.json"], "requires": ["npm"], "run": "npm run typecheck" },
+    { "name": "frontend tests", "workdir": "frontend", "only_if_exists": ["frontend/package.json"], "requires": ["npm"], "run": "npm test -- --run" }
+  ],
+  "devops-engineer": [
+    { "name": "shell syntax", "only_if_exists": ["scripts"], "run": "for f in scripts/*.sh; do [ -e \"$f\" ] || continue; bash -n \"$f\" || exit 1; done" },
+    { "name": "actionlint", "only_if_exists": [".github/workflows"], "requires": ["actionlint"], "run": "actionlint" }
+  ],
+  "test-engineer": [
+    { "name": "integration tests", "only_if_exists": ["tests/integration"], "requires": ["pytest"], "run": "pytest -q tests/integration" }
+  ]
+}
