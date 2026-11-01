@@ -13,14 +13,22 @@
 #   protect-dev : same but squash only and without ci/source-branch.
 # `agent-review/security` is required unconditionally; .github/workflows/security-gate.yml posts
 # `success: not required` when the PR does not touch the trust boundary.
-# Repo settings: auto-delete head branches; approval for workflows from outside contributors.
+# `ci/*` required checks are bound to GitHub Actions (integration_id 15368) so no other app can satisfy them.
+# Tag ruleset protect-release-tags: no deletion, no moving of v* tags (see the notice about actor scoping).
+# Repo settings: auto-delete head branches; approval for workflows from outside contributors; default workflow
+# token read-only; Actions may not create/approve PRs; SHA-pinning of actions required (when the API allows).
+#
+# HONEST LIMITS: none of this stops a PR from changing its own workflows (a PR can add a workflow with
+# `statuses: write` that forges any status). The backstop today is human approval of each merge plus the
+# tech-lead rule that any PR touching .github/** or security-gate.yml gets security-reviewer and a human flag
+# (accepted risk, board item Q2).
 set -euo pipefail
 
 DRY_RUN=0
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
-    -h|--help) sed -n '2,16p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,24p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -47,8 +55,10 @@ if [[ "$OWNER_TYPE" == "Organization" ]]; then
   echo "Require-workflows rule: supported (organization-owned). security-gate.yml will be pinned to dev."
 else
   echo "NOTICE: 'require workflows' rule NOT available (repo is owned by a $OWNER_TYPE, not an organization)."
-  echo "        A PR can therefore edit .github/workflows/security-gate.yml and pass its own gate; the"
-  echo "        .github/** trust-boundary path still forces security review for such a PR."
+  echo "        A PR can therefore modify its own gate, and could add a workflow with 'statuses: write' that"
+  echo "        forges ANY status. The .github/** path match only catches honest mistakes. The real backstop is"
+  echo "        human approval of each merge plus the rule that .github/** PRs get security-reviewer and a human"
+  echo "        flag (accepted risk, board item Q2)."
 fi
 
 # build_ruleset <name> <branch> <merge_method> <extra-check-or-empty> <with-workflows 0|1>
@@ -78,7 +88,8 @@ build_ruleset() {
         { type: "required_status_checks", parameters: {
             strict_required_status_checks_policy: true,
             do_not_enforce_on_create: false,
-            required_status_checks: (map({ context: . })) } }
+            required_status_checks: (map(if startswith("ci/")
+              then { context: ., integration_id: 15368 } else { context: . } end)) } }
       ] + (if $wf == 1 then [
         { type: "workflows", parameters: { workflows: [
           { repository_id: $repo_id, path: ".github/workflows/security-gate.yml", ref: "refs/heads/dev" } ] } }
@@ -89,11 +100,12 @@ build_ruleset() {
 apply_ruleset() { # json
   local json="$1" name id
   name="$(jq -r .name <<<"$json")"
-  id="$(gh api "repos/$REPO/rulesets" --jq ".[] | select(.name==\"$name\") | .id" | head -1)"
+  id="$(gh api --paginate "repos/$REPO/rulesets" --jq ".[] | select(.name==\"$name\") | .id" | head -1)"
   if [[ -n "$id" ]]; then echo "== ruleset '$name': UPDATE (id $id)"; else echo "== ruleset '$name': CREATE"; fi
-  jq -c '{name, target, enforcement, branch: .conditions.ref_name.include[0],
-          merge_methods: (.rules[] | select(.type=="pull_request") | .parameters.allowed_merge_methods),
-          required_checks: (.rules[] | select(.type=="required_status_checks") | [.parameters.required_status_checks[].context]),
+  jq -c '{name, target, enforcement, ref: .conditions.ref_name.include[0],
+          merge_methods: ([.rules[] | select(.type=="pull_request") | .parameters.allowed_merge_methods] | first),
+          required_checks: ([.rules[] | select(.type=="required_status_checks")
+            | [.parameters.required_status_checks[] | if .integration_id then "\(.context)@actions" else .context end]] | first),
           rules: [.rules[].type]}' <<<"$json"
   [[ $DRY_RUN -eq 1 ]] && return 0
   if [[ -n "$id" ]]; then
@@ -120,6 +132,20 @@ apply_with_fallback() { # name branch method extra
 apply_with_fallback "protect-main" "main" "merge" "ci/source-branch"
 apply_with_fallback "protect-dev" "dev" "squash" ""
 
+# Release tags: nobody may delete or move a published v* tag. The release workflow only creates tags, so
+# creation stays open. A user-owned repo cannot scope this rule by actor, so anyone with write access can still
+# CREATE a v* tag; that is why scripts/prod-guard.sh also requires HEAD == origin/main on that tag.
+TAG_RULESET='{
+  "name": "protect-release-tags", "target": "tag", "enforcement": "active", "bypass_actors": [],
+  "conditions": { "ref_name": { "include": ["refs/tags/v*"], "exclude": [] } },
+  "rules": [ { "type": "deletion" }, { "type": "non_fast_forward" }, { "type": "update" } ]
+}'
+apply_ruleset "$TAG_RULESET"
+if [[ "$OWNER_TYPE" != "Organization" ]]; then
+  echo "NOTICE: tag rule cannot be limited to the release workflow on a user-owned repo; v* tags are"
+  echo "        protected against deletion and moving, but tag CREATION is not restricted to CI."
+fi
+
 echo "== repo setting: delete head branches after merge -> true"
 if [[ $DRY_RUN -eq 0 ]]; then
   gh api -X PATCH "repos/$REPO" -F delete_branch_on_merge=true >/dev/null
@@ -130,6 +156,25 @@ if [[ $DRY_RUN -eq 0 ]]; then
   gh api -X PUT "repos/$REPO/actions/permissions/fork-pr-contributor-approval" \
     -f approval_policy=all_external_contributors >/dev/null \
     || echo "NOTICE: could not set fork-PR approval; set it in Settings -> Actions -> General."
+fi
+
+echo "== repo setting: default workflow token read-only; Actions may not create or approve PRs"
+if [[ $DRY_RUN -eq 0 ]]; then
+  gh api -X PUT "repos/$REPO/actions/permissions/workflow" \
+    -f default_workflow_permissions=read -F can_approve_pull_request_reviews=false >/dev/null \
+    || echo "NOTICE: could not set workflow permissions; set them in Settings -> Actions -> General."
+fi
+
+echo "== repo setting: require actions to be pinned to a full commit SHA"
+if [[ $DRY_RUN -eq 0 ]]; then
+  perms="$(gh api "repos/$REPO/actions/permissions")"
+  if jq -e 'has("sha_pinning_required")' <<<"$perms" >/dev/null; then
+    jq '{enabled, allowed_actions, sha_pinning_required: true}' <<<"$perms" \
+      | gh api -X PUT "repos/$REPO/actions/permissions" --input - >/dev/null \
+      || echo "NOTICE: could not enable SHA pinning; set it in Settings -> Actions -> General."
+  else
+    echo "NOTICE: the API does not expose sha_pinning_required for this repo; enable it in Settings -> Actions -> General if offered."
+  fi
 fi
 
 [[ $DRY_RUN -eq 1 ]] && echo "Dry run complete. Re-run without --dry-run to apply (after M0.2 and M0.6 have merged)."

@@ -5,6 +5,8 @@ updates:
     target-branch: dev
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     labels: [area:devops, security]
     commit-message:
       prefix: "chore(devops)"
@@ -14,6 +16,8 @@ updates:
     target-branch: dev
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     labels: [area:devops]
     commit-message:
       prefix: "chore(devops)"
@@ -22,6 +26,8 @@ updates:
     target-branch: dev
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     labels: [area:devops]
     commit-message:
       prefix: "chore(devops)"

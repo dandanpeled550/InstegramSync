@@ -7,7 +7,7 @@ SHELL := /bin/bash
 
 HAS_BACKEND  := $(wildcard backend/pyproject.toml)
 HAS_FRONTEND := $(wildcard frontend/package.json)
-HAS_FUNCTIONS := $(wildcard supabase/functions)
+HAS_FUNCTIONS := $(shell find supabase/functions -name '*.ts' -not -path '*/node_modules/*' 2>/dev/null | head -1)
 
 .PHONY: help dev test test-db lint fmt process process-prod replay eval
 
@@ -19,7 +19,7 @@ dev: ## Start local Supabase (Docker must be running)
 
 test: ## Unit tests (excludes tests/db, which needs a running database: see test-db)
 ifneq ($(HAS_BACKEND),)
-	cd backend && uv run pytest --ignore=tests/db ../tests
+	scripts/run-pytest.sh unit
 else
 	@echo "test: no backend/ yet, skipping"
 endif
@@ -29,7 +29,7 @@ endif
 
 test-db: ## DB tests against a local Supabase (run `make dev` first)
 ifneq ($(HAS_BACKEND),)
-	cd backend && uv run pytest ../tests/db
+	scripts/run-pytest.sh db
 else
 	@echo "test-db: no backend/ yet, skipping"
 endif
@@ -66,15 +66,11 @@ else
 	@echo "process: backend/app/process.py not implemented yet"
 endif
 
-# The production worker only runs from a clean checkout of `main` that sits exactly on a release tag.
-process-prod: ## Run the worker against PRODUCTION (main, clean, tagged only)
-	@branch="$$(git rev-parse --abbrev-ref HEAD)"; \
-	if [ "$$branch" != "main" ]; then echo "process-prod: refusing, on '$$branch' (need main)"; exit 1; fi; \
-	if [ -n "$$(git status --porcelain)" ]; then echo "process-prod: refusing, working tree not clean"; exit 1; fi; \
-	if ! git describe --exact-match --tags --match 'v[0-9]*' HEAD >/dev/null 2>&1; then \
-	  echo "process-prod: refusing, HEAD is not on a release tag (vX.Y.Z)"; exit 1; fi; \
-	echo "process-prod: checks passed ($$(git describe --exact-match --tags HEAD))"; \
-	echo "process-prod: worker not implemented yet"
+# The production worker only runs from a clean checkout of `main` equal to origin/main, on a strict
+# SemVer release tag (vX.Y.Z) that also exists on the remote. See scripts/prod-guard.sh.
+process-prod: ## Run the worker against PRODUCTION (main, clean, == origin/main, remote vX.Y.Z tag)
+	@scripts/prod-guard.sh
+	@echo "process-prod: worker not implemented yet"
 
 replay: ## Replay fixtures into the receiver (stub until M1)
 	@echo "replay: not implemented yet (test-engineer: scripts/replay*)"

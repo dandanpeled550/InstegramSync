@@ -1,6 +1,7 @@
 # PR checks: ci/lint, ci/typecheck, ci/test, ci/secrets.
 # Each job reports success (and skips its real work) while its area does not exist yet.
-# ci/test excludes tests/db: those need a running database and run in ci/migrations (added in M0.6).
+# ci/test runs pytest from the repo root via scripts/run-pytest.sh and excludes tests/db (they need a running
+# database and run in ci/migrations, added in M0.6). Exit code 5 (no tests collected) counts as success.
 # Trigger is `pull_request` (never pull_request_target): fork PRs get no secrets. No secrets are used here.
 name: pr-checks
 
@@ -29,7 +30,7 @@ jobs:
         id: area
         run: |
           [ -f backend/pyproject.toml ] && echo "backend=true" >> "$GITHUB_OUTPUT" || echo "backend=false" >> "$GITHUB_OUTPUT"
-          [ -d supabase/functions ] && echo "functions=true" >> "$GITHUB_OUTPUT" || echo "functions=false" >> "$GITHUB_OUTPUT"
+          [ -n "$(find supabase/functions -name '*.ts' -not -path '*/node_modules/*' 2>/dev/null | head -1)" ] && echo "functions=true" >> "$GITHUB_OUTPUT" || echo "functions=false" >> "$GITHUB_OUTPUT"
           [ -f frontend/package.json ] && echo "frontend=true" >> "$GITHUB_OUTPUT" || echo "frontend=false" >> "$GITHUB_OUTPUT"
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         if: steps.area.outputs.backend == 'true'
@@ -41,7 +42,7 @@ jobs:
           node-version: 22
       - name: Install backend deps
         if: steps.area.outputs.backend == 'true'
-        run: cd backend && uv sync
+        run: cd backend && if [ -f uv.lock ]; then uv sync --locked; else uv sync; fi
       - name: Install frontend deps
         if: steps.area.outputs.frontend == 'true'
         run: cd frontend && npm ci
@@ -72,7 +73,7 @@ jobs:
           node-version: 22
       - name: mypy (backend)
         if: steps.area.outputs.backend == 'true'
-        run: cd backend && uv sync && uv run mypy app
+        run: cd backend && if [ -f uv.lock ]; then uv sync --locked; else uv sync; fi && uv run mypy app
       - name: deno check (edge functions)
         if: steps.area.outputs.functions == 'true'
         run: find supabase/functions -name 'index.ts' -not -path '*/node_modules/*' -print0 | xargs -0 -r deno check
@@ -107,7 +108,9 @@ jobs:
           node-version: 22
       - name: Python tests (tests/db excluded)
         if: steps.area.outputs.backend == 'true'
-        run: cd backend && uv sync && uv run pytest --ignore=tests/db ../tests
+        run: |
+          (cd backend && if [ -f uv.lock ]; then uv sync --locked; else uv sync; fi)
+          scripts/run-pytest.sh unit
       - name: Deno tests (edge functions)
         if: steps.area.outputs.functions == 'true'
         run: deno test --no-check supabase/functions
@@ -135,4 +138,4 @@ jobs:
           mkdir -p "$RUNNER_TEMP/gl" && tar -xzf gitleaks.tgz -C "$RUNNER_TEMP/gl" gitleaks
           rm gitleaks.tgz
       - name: Scan history
-        run: '"$RUNNER_TEMP/gl/gitleaks" detect --source . --redact --no-banner --verbose'
+        run: '"$RUNNER_TEMP/gl/gitleaks" git --redact --no-banner --verbose .'
