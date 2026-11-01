@@ -23,6 +23,20 @@ for humans.
    to production and tags the release.
 7. Hotfix: `hotfix/<slug>` from `main` → PR to `main` → then PR `main → dev` (back-merge).
 
+## Checks
+
+PRs run `ci/lint`, `ci/typecheck`, `ci/test` and `ci/secrets`; PRs into `main` also run `ci/source-branch`.
+`security-gate` decides whether `agent-review/security` is needed (the `security` label or a trust-boundary
+path such as `.github/**`, `scripts/**` or `supabase/**`). Fork PRs get a read-only token, so the gate status
+cannot be posted and they stay blocked (fail-closed); maintainers re-open them from a branch in this repo.
+
+Warning: re-pushing a fork PR's code into a branch of this repository gives that code a write-scoped token
+in CI (a PR can modify its own workflows). Review the full diff, including `.github/**`, before doing it.
+
+The security gate is not tamper-proof: a PR can modify its own gate. The `.github/**` path match only catches
+honest mistakes. The backstop is human approval of each merge, plus the rule that any PR touching `.github/**`
+or `security-gate.yml` gets `security-reviewer` and a human flag.
+
 ## Never
 
 - Commit or push directly to `dev` or `main`.
