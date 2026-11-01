@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-11-01
-- Deciders: product owner (AGENTS_PLAN.md §15), architect
+- Deciders: product owner (AGENTS_PLAN.md §15); architect (proposed in PR #4) for the migration rules (5)
 
 ## Context
 - Many agents build in parallel in worktrees; their work must integrate safely and stay revertable.
@@ -30,8 +30,10 @@
 6. **Contracts first:** contract and ADR PRs (`docs/…` branches, scope `contracts`/`docs`) merge into `dev`
    before dependent feature branches start.
 7. **Public-repo hygiene:** no secrets, personal data, real Instagram content, media or the real eval set in
-   git; fixtures are synthetic or scrubbed; workflows use `pull_request`, never `pull_request_target`; secrets
-   live only in GitHub Environments and Supabase secrets.
+   git; fixtures are synthetic or scrubbed; workflows use `pull_request`, never `pull_request_target`. Secrets
+   live only in: GitHub Environments (CI), Supabase secrets (Edge Functions), the laptop's gitignored
+   `.env.<env>` files (service-role key, `DATABASE_URL`, `APP_PASSWORD`, `SESSION_SECRET`, model API keys),
+   and the `app_secrets` table (the Instagram token, service-role only).
 
 ## Alternatives considered
 | Option | Why not |

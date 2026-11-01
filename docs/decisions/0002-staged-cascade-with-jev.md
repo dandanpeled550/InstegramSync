@@ -2,7 +2,8 @@
 
 - Status: accepted
 - Date: 2026-11-01
-- Deciders: product owner (PLAN.md v2/v3), architect
+- Deciders: product owner (PLAN.md v2/v3) for the cascade, rubric and thresholds (1–5, 8); architect
+  (proposed in PR #4) for categories-as-`str` (6) and the `policy.py` placement (7)
 
 ## Context
 - Many shared posts are categorizable from the caption alone; others ("wait for it 😱") need the media.
@@ -32,10 +33,13 @@
    default) and `Titler`, owned by ai-engineer. Adapters own retries and raise `DeciderError` / `VisionError`;
    the worker marks the post `failed`. Title failures fall back to `fallback_title` and never fail a post.
 6. **Categories are data** (`categories` table), typed as `str` slugs in code, validated at run time.
-7. **Thresholds, rubric and `should_stop` live in `backend/app/decide/policy.py` (ai-engineer)**, not in
-   `config.py`: they are AI behavior and change only with an eval report. `config.py` (pipeline-engineer)
-   keeps runtime settings (batch size, timeouts, env vars). This resolves the PLAN §3 vs AGENTS_PLAN §4.6
-   inconsistency in favor of AGENTS_PLAN.
+7. **Thresholds, rubric and `should_stop` live in `backend/app/decide/policy.py` (ai-engineer)**: they are
+   AI behavior and change only with an eval report. `config.py` (pipeline-engineer) keeps runtime settings
+   (batch size, timeouts, env vars). The sources disagree: PLAN §3 puts thresholds in `config.py` and the
+   rubric in `decide/rubric.py`; AGENTS_PLAN §4.7 puts rubric + thresholds in `decide/policy.py`; AGENTS_PLAN
+   §4.6 lists `should_stop` among pipeline-engineer's pure functions. This follows AGENTS_PLAN §4.7 for
+   thresholds and rubric, and departs from §4.6 for `should_stop` (it stays pure; the cascade calls it).
+   There is no `decide/rubric.py`.
 8. **Retry after media deletion** reuses stored vision outputs (`reused: true`) and recomputes decisions.
 
 ## Alternatives considered

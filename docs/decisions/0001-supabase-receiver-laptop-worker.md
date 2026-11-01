@@ -2,7 +2,9 @@
 
 - Status: accepted
 - Date: 2026-11-01
-- Deciders: product owner (PLAN.md v3), architect
+- Deciders: product owner (PLAN.md v3) for the overall shape (1, 2, 3, 6, 7); architect (proposed in PR #4)
+  for the `text` + `check` choice (4), the `revoke`s and default-privilege hardening (5), conditional writes
+  and the 5-minute media wait
 
 ## Context
 - Meta delivers Instagram DM webhooks at any time and expects a fast `200`; delivery isn't guaranteed and the
@@ -23,12 +25,14 @@
    optionally `launchd`. It reaches Supabase with `DATABASE_URL` + the service-role key.
 3. **The `posts` table is the queue.** `status` (`received → analyzing → done | needs_review | failed`) drives
    the work; claims use `FOR UPDATE SKIP LOCKED`; rows stuck in `analyzing` > 30 min are recovered; every
-   worker write is conditional on `(status='analyzing', claimed_at)` so overlapping runs are safe
-   ([schema.md §3](../contracts/schema.md#3-postsstatus-state-machine)).
+   write is conditional — worker result/failed writes on `(status='analyzing', claimed_at)`, media-cleanup
+   writes on `status in ('done','needs_review') and media_path is not null` — so overlapping runs and API
+   actions during a run are safe ([schema.md §3](../contracts/schema.md#3-postsstatus-state-machine)).
 4. **Status and kind are `text` + named `check` constraints**, not Postgres enums, so adding a value is an
    expand-only migration.
 5. **Access is service-role only.** RLS on every table with no policies, plus `revoke all` from `anon` and
-   `authenticated`; the private `media` bucket has no `storage.objects` policies. The browser never talks to
+   `authenticated` and default privileges that keep future tables, sequences and functions in `public`
+   closed (catalog-wide tests); the private `media` bucket has no `storage.objects` policies. The browser never talks to
    Supabase — only to the local FastAPI.
 6. **Media is transient.** Copied on receipt, deleted once a post is `done`/`needs_review`, kept on `failed`
    for retry ([storage.md §4](../contracts/storage.md#4-lifecycle)).
