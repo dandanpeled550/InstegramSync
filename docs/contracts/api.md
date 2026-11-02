@@ -1,6 +1,12 @@
 # Local API contract — v0
 
-- Version: v0 (M0.1) · 2026-11-01 · owner: `architect`
+- Version: v0.1 (M0.1b) · 2026-11-01 · owner: `architect` — v0.1: `OPTIONS` answered before Origin/CSRF,
+  GET/HEAD side-effect rule, exact `API_DEV_ORIGIN` and Vite proxy rules ([ADR 0006](../decisions/0006-dev-proxy-preserves-host-origin.md)),
+  rate-limit wording, `insta_saver_session` cookie, single session key, in-process `rerun_requested`
+  · round 2: Vite `cors: false`, `preview.*`, `127.0.0.1` dev host, cookie residual risk, async handlers for
+  `rerun_requested` · round 3: Vite exact pin on a supported major maintained by Dependabot + `npm audit`
+  (replaces the 6.0.9 floor), tests for the background task's final step · round 4: CI installs with
+  `npm ci` from the committed lockfile
 - Implemented by `web-engineer` (FastAPI, `backend/app/api/**`, served by `python -m app.serve` on
   `http://127.0.0.1:8000`, also reachable as `http://localhost:8000`); consumed by the Vite/React SPA served
   from the same origin. The network boundary (§1.1) and auth (§1.2) rules are normative.
@@ -41,31 +47,65 @@
 ### 1.1 Network boundary ("localhost only")
 
 The server is reachable only from this machine, and only pages it served itself can drive it. Checks run in
-this order, before auth and before any handler:
+this order, before auth and before any handler. The first failing check answers:
 
 1. **Bind.** `serve.py` binds `API_HOST` (default and only supported v0 value `127.0.0.1`) on `API_PORT`
    (default `8000`). It refuses to start (non-zero exit, clear message) for any other `API_HOST` — in
    particular `0.0.0.0`, `::` or a LAN address. A future hosted mode (PLAN §8 "UI from
    your phone") is a contract change with an ADR; even then, a non-loopback bind with `AUTH_ENABLED=false`
-   refuses to start.
+   refuses to start. The URL `serve.py` prints, and the one docs use, is `http://127.0.0.1:<API_PORT>`
+   (not `localhost`, which may resolve to `::1`, where another local process could be listening).
 2. **Host allowlist** (DNS-rebinding defence), every request incl. static files: `Host` must equal
    `127.0.0.1:<API_PORT>` or `localhost:<API_PORT>` (plus the dev origin's host, below). Anything else,
    or a missing `Host` → `421 invalid_host`.
-3. **Origin allowlist**, every `/api/*` request: if `Origin` is present it must equal
+3. **No CORS.** `OPTIONS` on any path → `405 method_not_allowed`, before the Origin and CSRF checks, so every
+   preflight gets the same answer whatever its `Origin`. No CORS middleware and no `Access-Control-*` header on
+   any response. Same-origin only.
+4. **Origin allowlist**, every `/api/*` request: if `Origin` is present it must equal
    `http://127.0.0.1:<API_PORT>` or `http://localhost:<API_PORT>` (plus the dev origin); anything else,
    including `Origin: null` → `403 forbidden_origin`. A request without `Origin` (curl, tests) passes this
    check.
-4. **CSRF header**, every non-`GET`/`HEAD` `/api/*` request — `POST /api/login`, `PATCH`, and **the bodyless
+5. **CSRF header**, every non-`GET`/`HEAD` `/api/*` request — `POST /api/login`, `PATCH`, and **the bodyless
    ones** (`POST /api/process`, `POST /api/posts/{id}/retry`, `DELETE`): it must carry
    `X-Requested-With: insta-saver`, else `403 missing_csrf_header`. A custom header makes every cross-site
-   request a CORS preflight, which fails (rule 5). Requests with a body additionally need
+   request a CORS preflight, which fails (rule 3). Requests with a body additionally need
    `Content-Type: application/json`, else `415`.
-5. **No CORS.** No CORS middleware, no `Access-Control-*` header on any response, `OPTIONS` → `405`.
-   Same-origin only.
 
-Dev server: when `API_DEV_ORIGIN` is set (e.g. `http://localhost:5173`, the Vite dev server that proxies
-`/api`), that origin and its `host:port` are added to the two allowlists. It must be an `http` origin on a
-loopback host, else `serve.py` refuses to start. Unset by default.
+**`GET` and `HEAD` never change state.** No handler for them writes to the database or Storage, starts a
+worker run, sets a cookie, or touches the login rate limit. The CSRF exemption in rule 5 depends on this. The
+only `GET` routes are `/api/categories`, `/api/posts`, `/api/queue` and the static files (§3). Adding one is a
+contract change.
+
+**Dev server** (`API_DEV_ORIGIN`, unset by default). The Vite dev server proxies `/api` to the API:
+- `API_DEV_ORIGIN` must be exactly `http://<host>:<port>` with `<host>` = `localhost` or `127.0.0.1` and an
+  explicit port: no path (not even a trailing `/`), query, fragment or userinfo, and no other scheme.
+  Anything else → `serve.py` refuses to start.
+- When set, the origin string is added to the Origin allowlist and `<host>:<port>` to the Host allowlist.
+  Both are compared as **whole strings** — never prefix, suffix or substring matches (`http://localhost:5173`
+  does not admit `http://localhost:51730`).
+- The Vite proxy keeps the browser's `Host` and `Origin` (`changeOrigin: false`, Vite's default, and no
+  header rewriting), so the API's own checks still see a rebound hostname. Rules for `frontend/vite.config.*`
+  (web-engineer, [ADR 0006](../decisions/0006-dev-proxy-preserves-host-origin.md)):
+  - `server.host: "127.0.0.1"` (never `true`, `0.0.0.0` or `localhost`, which may resolve to `::1` — same
+    reason as rule 1). The documented dev setup is `API_DEV_ORIGIN=http://127.0.0.1:5173`.
+  - `server.allowedHosts` is never `true` (Vite's host check stays on).
+  - `server.strictPort: true`, so Vite never drifts to a port that doesn't match `API_DEV_ORIGIN`.
+  - `server.cors: false`. Vite's default CORS middleware runs before the proxy and admits any
+    `localhost` / `127.0.0.1` origin on any port; with it on, Vite answers `/api` preflights itself and adds
+    `Access-Control-Allow-Origin` to proxied responses, breaking rule 3 in dev.
+  - `vite preview` follows the same rules (`preview.host: "127.0.0.1"`, `preview.allowedHosts` never `true`,
+    `preview.strictPort: true`, `preview.cors: false`), since preview reuses `server.proxy`.
+  - **Vite version:** an **exact pin** (no `^` / `~` range) in `frontend/package.json` to the latest patch of
+    a **currently supported major** that has no open GitHub security advisory at pin time (as of 2026-11-02
+    that means 7.3.7+ or 8.3.3+, per the PR #13 security review). These numbers are an example, not a floor: the
+    pin is **maintained by Dependabot** (devops-engineer adds the `npm` ecosystem for `frontend/` to
+    `.github/dependabot.yml`) and checked by `npm audit --audit-level=moderate` in CI, which fails on any
+    advisory against the pinned version. `frontend/package-lock.json` is committed and CI installs with
+    `npm ci` (never `npm install`), so the audit and the build see exactly the locked tree, including
+    transitive dependencies. The restricted CORS default and host check this file relies on
+    arrived in 6.0.9 (CVE-2025-24010); later advisories (e.g. `server.fs.deny` bypasses, dev-server file read)
+    are why an old pin is not enough. web-engineer chooses the version; devops-engineer adds it after human
+    approval of the dependency.
 
 ### 1.2 Auth and session
 
@@ -75,18 +115,31 @@ loopback host, else `serve.py` refuses to start. Unset by default.
 - **Fail closed at startup** when auth is enabled: `serve.py` refuses to start if `APP_PASSWORD` is empty or
   shorter than 12 characters, or if `SESSION_SECRET` is shorter than 32 bytes (generate with
   `python -c "import secrets; print(secrets.token_urlsafe(32))"`).
-- **Session cookie** `session`: an itsdangerous `URLSafeTimedSerializer` token carrying its issued-at time,
+- **Session cookie** `insta_saver_session` (a name no other localhost app uses: cookies are not isolated by
+  port, so every server on `localhost` receives it and could overwrite a generic `session`): an itsdangerous
+  `URLSafeTimedSerializer` token carrying its issued-at time,
   `HttpOnly`, `SameSite=Strict`, `Path=/`, `Max-Age=2592000`, `Secure` when served over HTTPS (never in v0).
   The **server** enforces the 30 days: it verifies with `loads(token, max_age=2592000)`, so an old cookie is
-  rejected even if a client keeps it. The signing key is derived from `SESSION_SECRET` **and** a SHA-256 of
-  `APP_PASSWORD`, so changing either one invalidates every session. Stateless; no server-side session table.
+  rejected even if a client keeps it. The signing key is **one** key derived from `SESSION_SECRET` **and** a
+  SHA-256 of `APP_PASSWORD` (e.g. `HMAC-SHA256(key=SESSION_SECRET, msg=SHA-256(APP_PASSWORD))`), so changing
+  either one invalidates every session. Pass itsdangerous that single key, **never a list**: a list means
+  rotation keys, any one of them verifies, and a password change would not log anyone out. Stateless; no
+  server-side session table.
+- **Accepted residual risk — cookies are not port-scoped.** The browser sends `insta_saver_session` to every
+  server on `127.0.0.1` / `localhost`, whatever the port. Another local server the owner runs could read (and
+  replay) it. The unique name only prevents accidental overwrites. Accepted for v0: the threat model is a
+  single-user laptop, where a malicious local process already has more direct access (the `.env` with
+  `DATABASE_URL`). A hosted mode (PLAN §8) must revisit this (e.g. `__Host-` prefix over HTTPS).
 - **Kill switch / logout:** rotating `SESSION_SECRET` (and restarting the server) revokes every session.
 - **Login** compares `hmac.compare_digest(given.encode("utf-8"), APP_PASSWORD.encode("utf-8"))` — non-ASCII
   input is a normal wrong password (`401`), never a `500`.
-- **Rate limit** is checked **before** the password compare: more than 5 failed logins within 5 minutes →
-  every login attempt, even with the correct password, gets `429 rate_limited` until the window passes.
-  The client key is the socket peer address (`request.client.host`), never `X-Forwarded-For` or any other
-  header. With a loopback bind this is effectively one global limit — intended.
+- **Rate limit** is checked **before** the password compare. The server keeps the times of failed logins
+  (`401 invalid_password`) from the last 5 minutes. When **5 or more** are recorded, every login attempt —
+  even with the correct password — gets `429 rate_limited`, with `Retry-After` = whole seconds (≥ 1) until the
+  oldest of them is 5 minutes old. So after 5 failures within 5 minutes, the 6th attempt gets `429`. A `429`
+  is not itself a failure (it doesn't extend the lockout); a successful login clears the record. The
+  client key is the socket peer address (`request.client.host`), never `X-Forwarded-For` or any other
+  header. With a loopback bind this is effectively one global limit — intended. In-process only.
 - **Security headers** on every response (SPA and API): `Content-Security-Policy: default-src 'self';
   script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; object-src 'none';
   base-uri 'none'; frame-ancestors 'none'; form-action 'self'` (no inline script), plus
@@ -101,15 +154,20 @@ is about it.
 
 | Rule | Test |
 |---|---|
-| Bind | settings validation refuses `API_HOST` = `0.0.0.0`, `::`, `192.168.1.10`; accepts `127.0.0.1`. `API_DEV_ORIGIN` = `http://192.168.1.10:5173` or `https://localhost:5173` refused |
+| Bind | settings validation refuses `API_HOST` = `0.0.0.0`, `::`, `192.168.1.10`; accepts `127.0.0.1` |
+| Dev origin parsing | `API_DEV_ORIGIN` = `http://192.168.1.10:5173`, `https://localhost:5173`, `http://localhost`, `http://localhost:5173/`, `http://localhost:5173/app`, `http://user@localhost:5173`, `http://localhost.evil.example:5173` → refused; `http://localhost:5173` and `http://127.0.0.1:5173` accepted |
+| Vite config | (here or as a frontend test) parse `frontend/vite.config.*` (static read or by importing the config object): `server.host` and `preview.host` = `"127.0.0.1"`, `server.cors` and `preview.cors` = `false`, `strictPort: true` on both, no `allowedHosts: true`, no `changeOrigin: true` and no header-rewriting hook on the `/api` proxy; the `vite` entry in `frontend/package.json` is an exact version (matches `^[0-9]+\.[0-9]+\.[0-9]+$`, no range); CI's `npm audit --audit-level=moderate` for `frontend/` passes (devops, not this test) |
+| Dev origin exact match | with `API_DEV_ORIGIN=http://localhost:5173`: `Origin: http://localhost:5173` + `Host: localhost:5173` pass; `Origin: http://localhost:51730` → `403`; `Host: localhost:51730` → `421`; `Origin: http://localhost:5173.evil.example` → `403` |
 | Fail closed | auth on + `APP_PASSWORD` empty / 11 chars → refuses; `SESSION_SECRET` 31 bytes → refuses; `AUTH_ENABLED` unset, `"False"`, `"0"`, `"no"` → auth on |
 | Host | `Host: evil.example:8000`, `Host: 127.0.0.1:9999`, missing Host → `421` on `GET /api/posts` and `GET /`; both allowed hosts pass |
 | Origin | `Origin: http://evil.example`, `http://localhost:5173` (dev origin unset), `null` → `403` on a GET and on every non-GET endpoint; allowed origins and no Origin pass |
 | CSRF header | each of `POST /api/login`, `POST /api/process`, `POST /api/posts/{id}/retry`, `PATCH`, `DELETE` without the header → `403 missing_csrf_header`; wrong value → `403` |
 | Content-Type | `PATCH` / `POST /api/login` with `text/plain` body → `415` |
-| No CORS | no response (incl. `OPTIONS` with `Origin` + `Access-Control-Request-Method`, which gets `405`) has any `Access-Control-*` header |
-| Session | tampered cookie → `401`; cookie issued 30 days + 1 s ago (frozen clock) → `401`; cookie signed with a previous `SESSION_SECRET` → `401`; cookie issued before an `APP_PASSWORD` change → `401` |
-| Login | correct → `204` + cookie with the attributes above; wrong → `401`; non-ASCII password → `401`; 6th attempt after 5 failures with the **correct** password → `429` + `Retry-After`; varying `X-Forwarded-For` does not reset the limit |
+| No CORS | `OPTIONS` on `/api/posts` and on `/` with `Access-Control-Request-Method` and (a) no `Origin`, (b) an allowed `Origin`, (c) `Origin: http://evil.example` → `405 method_not_allowed` in all three cases; no response in the whole suite has any `Access-Control-*` header |
+| GET has no side effects | enumerate the app's routes: the `GET`/`HEAD` routes are exactly `/api/categories`, `/api/posts`, `/api/queue` and the static/SPA fallback; calling each one leaves the DB fakes, the worker starter and the rate-limit state untouched and sets no cookie |
+| Session | tampered cookie → `401`; cookie issued 30 days + 1 s ago (frozen clock) → `401`; cookie signed with a previous `SESSION_SECRET` → `401`; cookie issued before an `APP_PASSWORD` change → `401`; a cookie named `session` (not `insta_saver_session`) is ignored → `401` |
+| Login | correct → `204` + `insta_saver_session` cookie with the attributes above; wrong → `401`; non-ASCII password → `401` |
+| Rate limit | 5 wrong passwords within 5 minutes (frozen clock), then the **correct** password as the 6th attempt → `429` + `Retry-After` ≥ 1; further attempts during the lockout don't extend it — once the oldest failure is 5 min + 1 s old, the correct password → `204`; 4 wrong then correct → `204`, and the record is cleared (4 more wrong then correct → `204`); varying `X-Forwarded-For` does not reset the limit |
 | Headers | CSP and the other headers present on `GET /` and `GET /api/queue` |
 | Envelope | every error above uses the `{"error": {...}}` body |
 
@@ -162,7 +220,7 @@ Body: `{ "password": "…" }` (compared in constant time with `APP_PASSWORD`, §
 | Result | Response |
 |---|---|
 | rate limit active (checked first) | `429 rate_limited` — even for the correct password |
-| correct | `204`, `Set-Cookie: session=…` |
+| correct | `204`, `Set-Cookie: insta_saver_session=…` |
 | wrong | `401 invalid_password` |
 | `AUTH_ENABLED=false` | `204` (no cookie needed) |
 
@@ -245,11 +303,29 @@ Re-run the cascade. No body.
   `rerun_requested` flag. The background task checks the flag after `run_worker()` returns and, if it is
   set, clears it and calls `run_worker()` again — so the retried post is always processed without another
   click, even if the active run had already stopped claiming. An active run is **not** an error here.
+- `running` and `rerun_requested` are **in-process** state of this server (app state), never persisted — no
+  DB column. Each read-and-update of them is one synchronous step with no `await` in between: the retry
+  handler's "if `running` then set `rerun_requested`, else set `running` and start the task", and the
+  background task's final "if `rerun_requested` then clear it and loop, else set `running = false`". So a
+  retry cannot fall into a gap between the last check and `running = false`. If `run_worker()` raises, the
+  task logs it and then does the same final step (a set flag still causes exactly one more run).
+  "No `await` in between" is atomic only on the event-loop thread. So the `retry` and `process` handlers are
+  `async def`, and both read-and-update steps run on the event loop (`run_worker()` itself may run in a
+  threadpool; the final step runs after it returns, back on the loop). If either step ever has to run in
+  another thread (a sync `def` handler, or the final step inside the threadpool), both steps take one
+  shared `threading.Lock` instead. Tests: (1) the retry and process handlers **and** the background task
+  callable are coroutine functions (`inspect.iscoroutinefunction`); (2) with a fake `run_worker()` run in
+  the threadpool that blocks on an event, the task's final step records `threading.get_ident()` equal to the
+  event-loop thread's id; (3) a retry while the fake is blocked sets `rerun_requested`; releasing it gives
+  exactly one more run and then `running = false`; (4) the fake raising still runs the final step (one more
+  run if the flag was set, else `running = false`).
 - `202` + the updated Post object (`status: "received"`).
 - Media of `done`/`needs_review` posts is already deleted (or being deleted — an empty prefix counts as no
   media, storage.md §4), so their retry reuses stored vision evidence (interfaces.md §6); `failed` posts keep
   their media and re-run vision.
-- Test: a retry while a run is active (and past its last claim) leads to a second `run_worker()` call.
+- Tests: a retry while a run is active (and past its last claim) leads to a second `run_worker()` call; the
+  same when the first `run_worker()` raises; with no retry during the run, `run_worker()` is called once and
+  `GET /api/queue` then shows `running: false`.
 
 ### `DELETE /api/posts/{id}`
 - Deletes Storage objects under `{id}/`, then the row (storage.md §4). Allowed in any status (a worker that

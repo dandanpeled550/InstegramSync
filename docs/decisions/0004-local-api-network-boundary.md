@@ -1,6 +1,7 @@
 # 0004 — Local API: loopback bind, Host/Origin allowlists, CSRF header, server-checked sessions
 
-- Status: accepted
+- Status: accepted; decision 7 and the dev-proxy alternative under Consequences superseded by
+  [0006](0006-dev-proxy-preserves-host-origin.md)
 - Date: 2026-11-01
 - Deciders: product owner (PLAN.md §7: local page, single password, `AUTH_ENABLED=false` for localhost);
   architect (proposed in PR #4 after security review) for how "localhost only" is enforced

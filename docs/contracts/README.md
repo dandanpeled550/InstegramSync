@@ -5,11 +5,12 @@ files, not through conversation.
 
 | File | Contents | Status |
 |---|---|---|
-| [`schema.md`](schema.md) | Tables, columns, statuses + transitions, indexes, RLS, migration rules (mirrors `supabase/migrations/`) | v0 (M0.1) |
-| [`interfaces.md`](interfaces.md) | `Post`, `Decider`, `VisionModel`, `Evidence`, `StageDecision`, `CascadeResult`, `Titler`, policy, `run_worker` | v0 (M0.1); repo/storage signatures before M3 |
-| [`api.md`](api.md) | Local REST API: endpoints, JSON shapes, errors | v0 (M0.1) |
-| [`storage.md`](storage.md) | Storage bucket, path layout, access, lifecycle | v0 (M0.1) |
-| `payloads.md` | Real (scrubbed) Instagram webhook payload shapes, plus the receiver's security rules (fail closed on empty secrets/allowlist, HMAC over the raw body, per-event filter order, echo rule, handshake, no logging of bodies or tokens) | M1 (after the spike) — before receiver-engineer starts |
+| [`schema.md`](schema.md) | Tables, columns, statuses + transitions, indexes, RLS, migration rules (mirrors `supabase/migrations/`) | v0.1 (M0.1b) |
+| [`interfaces.md`](interfaces.md) | `Post`, `Decider`, `VisionModel`, `Evidence`, `StageDecision`, `CascadeResult`, `Titler`, policy, `run_worker` | v0.1 (M0.1b); repo/storage signatures before M3 |
+| [`api.md`](api.md) | Local REST API: endpoints, JSON shapes, errors | v0.1 (M0.1b) |
+| [`storage.md`](storage.md) | Storage bucket, path layout, access, lifecycle | v0.1 (M0.1b) |
+| [`receiver.md`](receiver.md) | `ig-webhook` security rules: fail closed on empty secrets/allowlist, body size cap, HMAC over the raw body, handshake, per-event filter order, echo rule, dedupe, logging, `verify_jwt`, required tests | v0 (M0.1b) — **binding from the M1 receiver v0** |
+| `payloads.md` | Real (scrubbed) Instagram webhook payload shapes (attachment types, reel/carousel keys, `unsupported_payload` reasons, observed body sizes) | M1 (after the spike) |
 
 Rules:
 - Minimal and testable: types, field names, error cases, one example each.
