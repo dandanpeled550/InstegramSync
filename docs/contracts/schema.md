@@ -3,7 +3,8 @@
 - Version: v0.1 (M0.1b) · 2026-11-01 · owner: `architect` — v0.1 adds the migration role guard, the owner and
   extension checks, the receiver media write and the exact PATCH statement (follow-ups from the PR #4 reviews);
   the read-only remote catalog check, CLI pin and connection rules from the migration-role research (PR #13
-  round 2)
+  round 2) · round 3: read-only login attributes, `seed.sql` scan matching, CLI `version:` input vs action
+  SHA, placeholder `sqlstate` may be `unknown`
 - Mirrors: `supabase/migrations/` (implemented by `data-engineer` in M0.5). Where this file and a migration
   disagree, the migration is a bug or this file needs an ADR — never silently "fix" one to match the other.
 - Source: [PLAN.md §6](../PLAN.md#6-store--supabase), [ADR 0001](../decisions/0001-supabase-receiver-laptop-worker.md).
@@ -77,7 +78,7 @@ One row per shared Instagram message. The table is also the work queue (see §3)
 | `current_stage` | `smallint` | yes | — | worker | stage in progress while `analyzing` (0–3) |
 | `claimed_at` | `timestamptz` | yes | — | worker | set on claim; used for stuck-row recovery |
 | `error` | `text` | yes | — | receiver, worker | exactly one of the §3.1 forms — never raw exception text, secrets, tokens, URLs or post content; ≤ 500 chars |
-| `raw_payload` | `jsonb` | no | — | receiver | the webhook `messaging` event exactly as received (shape: `payloads.md`, M1), **or** the receiver's placeholder `{"insta_saver_placeholder": "insert_rejected", "sqlstate": "<SQLSTATE>"}` when Postgres rejected the event permanently ([receiver.md §6](receiver.md#6-insert-and-dedupe)) |
+| `raw_payload` | `jsonb` | no | — | receiver | the webhook `messaging` event exactly as received (shape: `payloads.md`, M1), **or** the receiver's placeholder `{"insta_saver_placeholder": "insert_rejected", "sqlstate": "<SQLSTATE or unknown>"}` when Postgres (or PostgREST, `PGRST102`) rejected the event permanently ([receiver.md §6](receiver.md#6-insert-and-dedupe)) |
 | `created_at` | `timestamptz` | no | `now()` | DB | time the receiver stored the row |
 | `search_tsv` | `tsvector` | — | generated | DB | `generated always as (to_tsvector('simple', coalesce(title,'') \|\| ' ' \|\| coalesce(search_text,''))) stored` |
 
@@ -352,7 +353,14 @@ instead of a fixed list, so an object added later without RLS or revokes fails t
 - Every file in `supabase/migrations/` starts with the migration role guard (§6), checked by a file scan:
   skipping only SQL comments and blank lines, the first statement is a `do` block containing the token
   `current_user <> 'postgres'` (match the token, not the message).
-- `supabase/seed.sql` contains no `create`, `alter`, `drop`, `grant` or `revoke` (file scan; §6).
+- `supabase/seed.sql` creates no objects (§6), checked by a file scan. First remove `--` line comments,
+  `/* … */` block comments and single-quoted string literals (with `''` escapes). Then: (a) the text has no
+  dollar quote (`$$` or `$tag$`); (b) every statement (split on `;`) starts with `insert into`; (c) none of
+  the keywords `create`, `alter`, `drop`, `grant`, `revoke`, `truncate`, `execute`, `copy`, `set role`,
+  `reset role` appears (a `do` block is already excluded by (a) and (b)). Keywords match
+  **case-insensitively on word boundaries** (`\bcreate\b`), so `created_at` or a literal `'created by seed'`
+  never trip it, while `on conflict do nothing` is allowed. Scan tests: `CREATE TABLE x()` → flagged; `-- never create objects here` → passes;
+  `insert … values ('drop me')` → passes; `do $$ begin execute 'create table t()'; end $$;` → flagged.
 - **Future objects:** inside a rolled-back transaction, as `postgres`, create a throwaway table, sequence,
   function and view in `public`; each role has no privilege on any of them (proves the default privileges).
   And no `pg_default_acl` entry of `defaclrole = 'postgres'` (global or for `public`) grants anything to
@@ -379,11 +387,19 @@ Rules for that check:
   extension in `public`, owners, `pg_default_acl` entries of `postgres`, no policies. **No DDL or DML probe**
   against a remote database: not the throwaway-object check, not the per-role CRUD tests, not
   `nextval`. The query result is a list of findings; empty = pass.
-- It connects with a **read-only login** (a role with `CONNECT` and catalog read only, no table rights), held
-  in an environment-scoped GitHub secret, not the `postgres` password. `has_*_privilege()`, `pg_class`,
-  `pg_proc`, `pg_extension`, `pg_policies` and `pg_default_acl` are readable by any role. Creating that role is
-  a human step in the dashboard (devops documents it); until it exists, devops may use the deploy
-  credential, flagged as an open issue.
+- It connects with a **read-only login**, held in an environment-scoped GitHub secret, not the `postgres`
+  password. That role is `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS
+  CONNECTION LIMIT 2`, with `alter role … set default_transaction_read_only = on`, **no role memberships**
+  (never `pg_read_all_data`, `pg_monitor` or any Supabase role) and no table, sequence or function rights.
+  Its only grant is `CONNECT` on the database: the queries join `pg_class` / `pg_namespace` / `pg_proc` by
+  OID (no `'public.x'::regclass` name lookups), so no schema `USAGE` is needed. `has_*_privilege()`,
+  `pg_class`, `pg_proc`, `pg_extension`, `pg_policies` and `pg_default_acl` are readable by any role.
+  Creating that role is a human step in the dashboard (devops documents it); until it exists, devops may use
+  the deploy credential, flagged as an open issue.
+- The check always runs inside `begin transaction read only`, whatever the credential. With the read-only
+  login its first query also asserts the login itself: `current_setting('default_transaction_read_only') =
+  'on'` and no `pg_auth_members` row with it as `member`; otherwise the check fails. With the interim deploy
+  credential that assertion is skipped and the run output says so.
 
 It closes the gap where the remote migration role differs, gets Supabase's default grants, and the local
 tests still pass. It is also the backstop for CLI role drift inside a migration file (§6).
@@ -440,10 +456,11 @@ Do not weaken the guard to `pg_has_role(current_user, 'postgres', 'member')` (it
 outcome. Report it. The fix is a contract change; removing the guard is never the fix.
 
 **CLI and connection rules** (devops-engineer, `ci/migrations` and both deploy workflows):
-- Pin `supabase/setup-cli` to exactly **v2.122.0** (the version the research read), never `latest` and never
-  a range such as "≥ v2.90.0". v2.122.0 contains the two fixes the step-down depends on: `b08e6e1f` (re-run
-  the step-down on every new connection) and `0c721790` (restore `postgres` after `RESET ROLE` / at the end of
-  each file). Raising the pin is a contract change that re-checks both.
+- Pin the **CLI** to exactly **v2.122.0** (the version the research read) through the `version: 2.122.0`
+  input of `supabase/setup-cli`, never `latest` and never a range such as "≥ v2.90.0". The action itself is
+  pinned by full commit SHA like every action; the two pins are separate. v2.122.0 contains the two fixes
+  the step-down depends on: `b08e6e1f` (re-run the step-down on every new connection) and `0c721790`
+  (restore `postgres` after `RESET ROLE` / at the end of each file). Raising the pin is a contract change that re-checks both.
 - Deploy with `SUPABASE_DB_PASSWORD` (direct host or the CLI's own pooler config, which uses session mode on
   port 5432). Never a hand-built `--db-url` on pooler port **6543** (transaction mode does not keep
   session-level `set session role`).
