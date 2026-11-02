@@ -112,7 +112,11 @@ class UnsupportedPayload(ValueError):
 
 def parse(raw_payload: Mapping[str, Any]) -> ParsedPayload:
     """Pure function; no I/O. Raises UnsupportedPayload; never returns partial garbage.
-    Exact payload shapes: payloads.md (M1)."""
+    Exact payload shapes: payloads.md (M1).
+
+    Checked first: if raw_payload has the key "insta_saver_placeholder" (the receiver's
+    placeholder for an event Postgres rejected, receiver.md §6), raise
+    UnsupportedPayload("insert_rejected"), whatever else the mapping contains."""
     ...
 ```
 

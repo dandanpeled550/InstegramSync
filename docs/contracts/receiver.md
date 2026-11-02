@@ -1,6 +1,8 @@
 # Receiver security contract — v0
 
-- Version: v0 (M0.1b) · 2026-11-01 · owner: `architect`
+- Version: v0 (M0.1b) · 2026-11-02 · owner: `architect` — round 2: per-event insert with transient /
+  permanent classification and a placeholder row, verify-token digest compare and length floor, malformed
+  `Content-Length`, `HEAD`/`OPTIONS`, extended test table
 - Implemented by `receiver-engineer` in `supabase/functions/ig-webhook/` (Deno / TypeScript).
 - **Binding from the M1 receiver v0** (the spike build), not only from M2. Every rule here holds for any
   deployed `ig-webhook`, whatever else it does yet. A receiver PR that skips one fails security review.
@@ -21,7 +23,7 @@ Supabase secrets, per project (`supabase secrets set …`, never in git; `.env.e
 | Variable | Valid when | Used for |
 |---|---|---|
 | `META_APP_SECRET` | non-empty after trimming | HMAC key for `X-Hub-Signature-256` |
-| `META_VERIFY_TOKEN` | non-empty after trimming | GET handshake |
+| `META_VERIFY_TOKEN` | **at least 32 characters** after trimming; generated, e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"` (43 characters) | GET handshake |
 | `ALLOWED_SENDER_IDS` | comma-separated list; items trimmed, empty items ignored; **at least one item, and every item matches `^[0-9]+$`** | sender allowlist |
 
 The function reads them **on every request** (no caching across a config change). If any one is unset,
@@ -31,22 +33,26 @@ signature check, no DB access, no outbound fetch, no DM. The log line names the 
 to 36 h, so events sent while the function is misconfigured are redelivered once it is fixed.
 
 Why these rules: an HMAC with an empty key can be forged by anyone, and an empty allowlist must mean
-"nobody", never "everybody". Requiring digits-only items rules out wildcards such as `*`.
+"nobody", never "everybody". Requiring digits-only items rules out wildcards such as `*`. A short verify
+token makes the handshake's `200`/`403` answer a guessing oracle.
 
-`SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are injected by the platform; a missing one is also a
-`500` with no further processing.
+`SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are injected by the platform. They are checked in the same
+step and also read on every request: a missing or empty one is a `500` with an empty body and no I/O
+(`config_invalid: SUPABASE_URL`). The DB client may be built per request, or cached keyed on these two
+values; never built once at module load.
 
 ## 2. Request handling, in this order
 
 | Step | Check | On failure |
 |---|---|---|
 | 1 | Configuration valid (§1) | `500` |
-| 2 | Method is `GET` (handshake, §3) or `POST` (events, steps 3–7) | `405` |
-| 3 | Body size: `Content-Length`, when present, ≤ `MAX_BODY_BYTES`; then read the body as a stream and stop as soon as more than `MAX_BODY_BYTES` bytes have arrived (a missing or false `Content-Length` doesn't help an attacker) | `413`, body not hashed or parsed |
-| 4 | Signature (§4) over the **exact raw bytes** read in step 3 | `403` |
+| 2 | Method is `GET` (handshake, §3) or `POST` (events, steps 3–7). Everything else, **including `HEAD` and `OPTIONS`**, is rejected. There is no CORS handler: do not copy the stock Supabase function template's `OPTIONS` / `Access-Control-Allow-Origin: *` block | `405` |
+| 3a | `Content-Length`, when present, is a single value matching `^[0-9]+$`. Non-numeric, negative, empty or comma-joined values are malformed and are never read as `0` | `400`, body not read |
+| 3b | Body size: `Content-Length`, when present, ≤ `MAX_BODY_BYTES`; then read the body as a stream and stop as soon as more than `MAX_BODY_BYTES` bytes have arrived (a missing or false `Content-Length` doesn't help an attacker) | `413`, body not hashed or parsed |
+| 4 | Signature (§4) over the **exact raw bytes** read in step 3b | `403` |
 | 5 | Decode UTF-8 (fatal on invalid bytes), `JSON.parse`, require `object === "instagram"` and an `entry` array | `200`, nothing stored (logged as `ignored: unparsable` / `ignored: not_instagram`) — a signed body that never parses would only be retried uselessly |
 | 6 | Filter **each** `entry[].messaging[]` event on its own (§5) | dropped events are counted, not errors |
-| 7 | Insert each event that passed (§6), awaited before responding | `500` if any insert failed (Meta redelivers; dedupe makes it safe) |
+| 7 | Insert **each** event that passed, independently (§6), all awaited before responding | `500` if at least one insert failed **transiently**; permanent rejections count as handled |
 | — | Respond | `200`, empty body |
 
 Rules that tie the steps together:
@@ -54,10 +60,12 @@ Rules that tie the steps together:
   before step 4 passed **and** the event passed step 6. A request rejected in steps 1–4 causes no I/O beyond
   reading its own body.
 - **Always `200` after a valid signature**, including when every event was filtered out, the body was ignored
-  in step 5, or every event was a duplicate. The only non-`200` after a valid signature is `500` for a failed
-  insert. Respond as soon as the inserts are done: media copy and the ack DM (M2) never delay the response —
-  they run in `EdgeRuntime.waitUntil(...)` after it.
-- Error responses have an empty body: no reason, no echo of input.
+  in step 5, every event was a duplicate, or an insert was rejected permanently (§6). The only non-`200`
+  after a valid signature is `500` for a transient insert failure. Respond as soon as the inserts are done:
+  media copy and the ack DM (M2) never delay the response — they run in `EdgeRuntime.waitUntil(...)` after
+  it.
+- **Error responses have an empty body** (`400`, `403`, `405`, `413`, `500`): no reason, no echo of input.
+- **No `Access-Control-*` header on any response.**
 
 **`MAX_BODY_BYTES` = 1 MiB (1,048,576 bytes).** Justification, against
 [research: Edge Functions](../research/supabase-edge-functions.md): the platform's own request-body limit is
@@ -73,23 +81,30 @@ contract change.
 Read the query with `new URL(req.url).searchParams` (the dots in `hub.*` are literal).
 
 - `hub.mode` must equal `"subscribe"`.
-- `hub.verify_token` must equal `META_VERIFY_TOKEN`, compared in **constant time** over the UTF-8 bytes (§4).
-- `hub.challenge` must be present, non-empty and ≤ 128 characters.
+- `hub.verify_token` must equal `META_VERIFY_TOKEN`, compared as **SHA-256 digests** (§4, verify-token
+  compare). A missing `hub.verify_token` is a mismatch.
+- `hub.challenge` must match `^[0-9]{1,128}$` (the research says Meta sends an integer; if the M1 spike shows
+  otherwise, widening this is a contract change).
 - All three hold → `200`, body = the `hub.challenge` value exactly, `Content-Type: text/plain; charset=utf-8`,
   `X-Content-Type-Options: nosniff`. Never HTML or JSON.
 - Anything else → `403`, empty body. The handshake never touches the DB.
 
-## 4. Signature (`POST`)
+## 4. Signature (`POST`) and constant-time compares
 
 - Header `X-Hub-Signature-256` must be present and of the form `sha256=` followed by exactly 64 hex digits.
   Missing, another prefix, wrong length or non-hex → `403`.
-- Expected value = HMAC-SHA256(key = `META_APP_SECRET` as UTF-8, message = the raw request bytes from step 3).
+- Expected value = HMAC-SHA256(key = `META_APP_SECRET` as UTF-8, message = the raw request bytes from step 3b).
   Never hash a re-serialized or re-encoded body: Meta escapes non-ASCII as `\uXXXX` in what it signs, so
   `JSON.stringify(JSON.parse(body))` does not reproduce the signed bytes.
-- Compare in **constant time**: `crypto.subtle.verify("HMAC", key, receivedBytes, rawBody)`, or a
-  constant-time compare of two equal-length byte arrays (e.g. `timingSafeEqual` from `@std/crypto`). Never
-  `===` / `==` on strings, hex or base64. The same helper is used for the verify token in §3.
+- Compare in **constant time**: `crypto.subtle.verify("HMAC", key, receivedBytes, rawBody)` with the 32 bytes
+  decoded from the 64 hex digits, or a constant-time compare of two 32-byte arrays (e.g. `timingSafeEqual`
+  from `@std/crypto`). Never `===` / `==` on strings, hex or base64.
 - Mismatch → `403`. Parsing (step 5) starts only after a match.
+
+**Verify-token compare** (§3): compute `SHA-256(UTF-8(hub.verify_token))` and `SHA-256(UTF-8(META_VERIFY_TOKEN))`
+— always 32 bytes each — and compare the digests with `timingSafeEqual`. There is **no** length check before
+it and no early return on a length difference: `timingSafeEqual` on raw values of different lengths throws or
+returns early, which leaks the token length.
 
 ## 5. Per-event filter
 
@@ -121,8 +136,37 @@ the worker marks it `failed` with `unsupported_payload: <reason>` (schema.md §3
 - **Dedupe on `message.mid`.** Meta retries failed deliveries for up to 36 h, so duplicates are normal. No row
   returned = duplicate → nothing else happens for that event (no media copy, no DM), and it still counts as
   success.
-- Only rows that were actually inserted get background work (media copy, ack DM — M2), even if a later
-  insert in the same request failed.
+- **Every accepted event is attempted independently**, in batch order. A failed insert never stops the
+  others. Background work (media copy, ack DM — M2) is scheduled for every row that was actually inserted
+  (not a duplicate, not a placeholder), whatever happened to the other events and even if the response is
+  `500`; a redelivery then dedupes those rows.
+
+**Insert errors.** The SQLSTATE is the `code` of the PostgREST error body when it is a five-character
+SQLSTATE (`PGRST…` codes are not SQLSTATEs). Each failed insert is classified:
+
+| Class | Errors | Outcome for that event |
+|---|---|---|
+| **Permanent** | SQLSTATE class `22` (data exception, e.g. `22P05`: jsonb rejects a `\u0000` escape in third-party caption text) or class `23` (integrity; `23505` on `message_mid` never surfaces, `on conflict` absorbs it) | log `insert_rejected: <SQLSTATE>`, store the **placeholder row** below, counts as handled |
+| **Transient** | everything else: network error, timeout, no response, PostgREST HTTP `5xx`, SQLSTATE classes `08`, `40`, `53`, `57` (and any other class, e.g. `42` after a bad migration), `PGRST…` / HTTP `401`/`403` from a wrong key | log `insert_failed: <SQLSTATE \| HTTP status \| exception class>`; the response is `500` so Meta redelivers |
+
+Unknown errors default to **transient**: a redelivery after the cause is fixed stores the event, and dedupe
+makes the retry safe. Only the two classes above are known to fail the same way forever.
+
+**Placeholder row** (permanent rejection only). So the owner sees that a share failed instead of it vanishing,
+the receiver inserts, with the same `on conflict (message_mid) do nothing`:
+
+```text
+message_mid = message.mid, sender_id = sender.id,
+raw_payload = {"insta_saver_placeholder": "insert_rejected", "sqlstate": "<SQLSTATE>"}
+```
+
+`raw_payload` holds only this fixed marker, never any part of the event. The worker's `parse()` raises
+`UnsupportedPayload("insert_rejected")` for it (interfaces.md §1), so the row ends `failed` with
+`unsupported_payload: insert_rejected` and shows up in the UI. A placeholder gets no background work (no media
+copy, no ack DM). If the placeholder insert itself fails, the same table applies: permanent → log
+`placeholder_rejected: <SQLSTATE>` and count as handled (the event is lost; the log line is the only trace);
+transient → `500`.
+
 - **Post-upload write (M2 media copy):** after all attachments of a post were attempted, **one** update sets
   `media_path` and `error` together, conditional on `status = 'received'` — exact statement, zero-rows meaning
   and why it can't race the worker in [schema.md §3](schema.md#3-postsstatus-state-machine) (write
@@ -130,7 +174,7 @@ the worker marks it `failed` with `unsupported_payload: <reason>` (schema.md §3
 
 ## 7. Outbound calls (M2)
 
-- The ack DM is sent only for a newly inserted row, inside `waitUntil`, after the response.
+- The ack DM is sent only for a newly inserted, non-placeholder row, inside `waitUntil`, after the response.
 - The Graph API token (`app_secrets.ig_access_token`) goes in an `Authorization: Bearer` header, never in a URL
   query string (`?access_token=` ends up in error messages and logs). Graph API support for the header with
   Instagram Login is checked in M2; if only the query form works, the request URL is never logged or
@@ -141,11 +185,11 @@ the worker marks it `failed` with `unsupported_payload: <reason>` (schema.md §3
 
 Allowed in logs: the HTTP status and outcome code, `pathname` (never the full URL — the handshake query
 contains `hub.verify_token`), body byte length, counts per drop reason, number of rows inserted, inserted
-`posts.id` values, exception class names and SQLSTATE codes.
+`posts.id` values, exception class names, SQLSTATE codes and the HTTP status of a failed DB call.
 
 Never logged: the raw or parsed body or any part of it (captions, CDN URLs, `mid`s, sender ids), request
 headers (`X-Hub-Signature-256`, `Authorization`, `apikey`), the query string, any env value or token, and
-database error messages or details (they can echo row values — log the SQLSTATE only).
+database error messages, details or hints (they can echo row values — log the SQLSTATE only).
 
 ## 9. Deployment
 
@@ -157,23 +201,29 @@ database error messages or details (they can echo row values — log the SQLSTAT
 
 ## 10. Tests `receiver-engineer` must write (Deno, no network)
 
-Inject env, a fake DB client and a fake `fetch`; every test also checks what the fakes recorded.
+Inject env, a fake DB client and a fake `fetch`; every test also checks what the fakes recorded. Every
+error-status test also asserts an **empty body**, and the whole suite asserts that no response carries an
+`Access-Control-*` header.
 
 | Rule | Test |
 |---|---|
-| Fail closed | each of the three variables unset / `""` / `"  "` → `GET` and `POST` both `500`, zero DB calls, zero fetches. `ALLOWED_SENDER_IDS` = `","`, `"abc"`, `"123,*"` → `500` |
-| Method | `PUT` → `405` |
-| Handshake | correct → `200`, body = challenge, `text/plain`; wrong token, token differing only in the last character, missing token, `hub.mode=unsubscribe`, missing challenge, 129-char challenge → `403`; no DB call in any case |
+| Fail closed | each of the three variables unset / `""` / `"  "` → `GET` and `POST` both `500`, zero DB calls, zero fetches. `ALLOWED_SENDER_IDS` = `","`, `"abc"`, `"123,*"` → `500`. `META_VERIFY_TOKEN` of 31 characters → `500`; 32 → accepted |
+| Platform env | `SUPABASE_URL` or `SUPABASE_SERVICE_ROLE_KEY` unset / `""` → `GET` and `POST` `500`, empty body, zero DB calls, zero fetches |
+| Config per request | one handler instance: request 1 with valid env → `200`; set `ALLOWED_SENDER_IDS=""` → request 2 → `500`; restore → request 3 → `200`. Same with a changed `ALLOWED_SENDER_IDS` value: request 2 uses the new list |
+| Method | `PUT`, `HEAD`, `OPTIONS` (with `Origin` and `Access-Control-Request-Method`) → `405`, empty body, no `Access-Control-Allow-Origin` |
+| Handshake | correct → `200`, body = challenge, `Content-Type: text/plain; charset=utf-8`, `X-Content-Type-Options: nosniff`; wrong token, token differing only in the last character, token differing only in length (the real token plus one character, and its first 31 characters), missing token, `hub.mode=unsubscribe`, missing challenge, 129-digit challenge, non-digit challenge → `403`; no DB call in any case |
+| Content-Length | `Content-Length: abc`, `-1`, `""`, `10, 10` → `400`, body not read |
 | Size | `Content-Length: 1048577` → `413` without reading the body; a chunked body of 1 MiB + 1 byte with no `Content-Length` → `413`; a body of exactly 1 MiB with a valid signature → processed |
 | Signature | valid → `200`; header missing, prefix `sha1=`, 63 hex digits, non-hex, wrong digest → `403`, zero DB calls; a body containing `é` signed over its raw bytes → accepted, while the same signature checked against `JSON.stringify(JSON.parse(body))` would fail (proves raw bytes are hashed) |
 | Order | invalid signature with an allowlisted sender in the body → zero DB calls, zero fetches |
 | Echo | allowlisted sender with `is_echo: true` → not inserted; event with `sender.id === entry.id` and no `is_echo` → not inserted; both → `200` |
-| Allowlist | unknown sender → not inserted, `200`; one batch with 2 entries and 3 events (allowed, echo, stranger) → exactly 1 insert; an entry whose `id` is allowlisted → nothing from it inserted |
+| Allowlist | unknown sender → not inserted, `200`; one batch with 2 entries and 3 events (allowed, echo, stranger) → exactly 1 insert; an entry whose `id` is allowlisted → nothing from it inserted, and the log contains `config_error: bot_id_allowlisted` |
 | Shape | event without `message.mid` (e.g. a reaction) → not inserted, `200` |
 | Body ignored | valid signature + invalid JSON, invalid UTF-8, or `object: "page"` → `200`, zero inserts |
 | Dedupe | insert returns no row → no background work scheduled, `200` |
-| DB failure | insert throws → `500`; background work is scheduled only for rows inserted before the failure |
-| Logging | capture all log output across the suite: it never contains the body, the signature value, `META_APP_SECRET`, `META_VERIFY_TOKEN`, a sender id, a `mid` or a query string |
+| Permanent rejection | batch of 3 accepted events, the 2nd insert fails with SQLSTATE `22P05` → `200`; events 1 and 3 inserted and get background work; a placeholder row for event 2 with `raw_payload` = exactly the marker; log has `insert_rejected: 22P05` and no DB error message. Same with a class `23` code. Placeholder insert also failing with `22P05` → `200`, log `placeholder_rejected: 22P05` |
+| Transient failure | batch of 3, the 2nd insert fails with each of: thrown network error, HTTP `503`, SQLSTATE `08006`, `40001`, `53300`, `57014`, `42P01`, `PGRST301` → `500`; events 1 **and 3** still inserted and get background work; no placeholder |
+| Logging | capture all log output across the suite: it never contains the body, the signature value, `META_APP_SECRET`, `META_VERIFY_TOKEN`, a sender id, a `mid`, a query string or a DB error message |
 | Deploy config | parse `supabase/config.toml`: `[functions.ig-webhook] verify_jwt = false`, and no other function and no project-level setting has `verify_jwt = false` |
 | Post-upload write (M2) | the media write is the single conditional update from schema.md §3; zero rows updated → no throw, no retry |
 
@@ -200,3 +250,8 @@ With `ALLOWED_SENDER_IDS=1000000000000001`: the first event is inserted (`messag
 - **Handshake query in platform logs:** Supabase's own invocation logs may record the request URL, including
   `hub.verify_token`. Low impact (the token only answers Meta's handshake); rotating `META_VERIFY_TOKEN` after
   setup is an option. Confirm in M1 what the platform logs show.
+- **Sustained failures (researcher, M1 spike checklist):** does Meta alert, throttle, flag or disable a
+  webhook subscription after sustained non-`200` responses (e.g. hours of config `500`s after a typo in
+  `ALLOWED_SENDER_IDS`), and how is it re-enabled? The research covers retries for up to 36 h only. Until
+  answered, a config `500` is treated as an incident to fix within hours.
+- **`hub.challenge` format:** digits-only per the research; confirm in the M1 spike.

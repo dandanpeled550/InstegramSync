@@ -77,7 +77,7 @@ One row per shared Instagram message. The table is also the work queue (see §3)
 | `current_stage` | `smallint` | yes | — | worker | stage in progress while `analyzing` (0–3) |
 | `claimed_at` | `timestamptz` | yes | — | worker | set on claim; used for stuck-row recovery |
 | `error` | `text` | yes | — | receiver, worker | exactly one of the §3.1 forms — never raw exception text, secrets, tokens, URLs or post content; ≤ 500 chars |
-| `raw_payload` | `jsonb` | no | — | receiver | the webhook `messaging` event exactly as received (shape: `payloads.md`, M1) |
+| `raw_payload` | `jsonb` | no | — | receiver | the webhook `messaging` event exactly as received (shape: `payloads.md`, M1), **or** the receiver's placeholder `{"insta_saver_placeholder": "insert_rejected", "sqlstate": "<SQLSTATE>"}` when Postgres rejected the event permanently ([receiver.md §6](receiver.md#6-insert-and-dedupe)) |
 | `created_at` | `timestamptz` | no | `now()` | DB | time the receiver stored the row |
 | `search_tsv` | `tsvector` | — | generated | DB | `generated always as (to_tsvector('simple', coalesce(title,'') \|\| ' ' \|\| coalesce(search_text,''))) stored` |
 
@@ -145,7 +145,7 @@ relevant, informativeness, decided_at_stage, evidence`.
 
 | From | To | Actor | Exact write |
 |---|---|---|---|
-| — | `received` | receiver | `insert (message_mid, sender_id, raw_payload) … on conflict (message_mid) do nothing returning id` |
+| — | `received` | receiver | `insert (message_mid, sender_id, raw_payload) … on conflict (message_mid) do nothing returning id` — with the event, or with the placeholder `raw_payload` after a permanent rejection (receiver.md §6) |
 | `received` | `received` | receiver media write (M2, [receiver.md §6](receiver.md#6-insert-and-dedupe)) | once per new row, after all attachments were attempted: `media_path` and `error` **in one update** — `('{id}/', null)`, `('{id}/', 'media_copy_partial')` or `(null, 'media_copy_failed')` |
 | `received` | `analyzing` | worker claim | `status='analyzing', current_stage=0, claimed_at=now()` — see claim query below (`error` is left as-is so a receiver `media_copy_*` code stays visible until the result is written) |
 | `analyzing` | `received` | worker recover | rows with `claimed_at < now() - interval '30 minutes'`: `status='received', current_stage=null, claimed_at=null` |
@@ -238,7 +238,7 @@ These invariants are enforced in code (repo layer), not by DB constraints, in v0
 |---|---|---|
 | `media_copy_partial` | receiver | some attachments could not be stored (storage.md §4) |
 | `media_copy_failed` | receiver | no attachment could be stored |
-| `unsupported_payload: <reason>` | worker | `parse()` raised `UnsupportedPayload`; `<reason>` is its machine code (`no_attachment`, `unsupported_type`, … — final list in `payloads.md`, M1) |
+| `unsupported_payload: <reason>` | worker | `parse()` raised `UnsupportedPayload`; `<reason>` is its machine code (`no_attachment`, `unsupported_type`, … — final list in `payloads.md`, M1; `insert_rejected` = the receiver stored a placeholder, receiver.md §6) |
 | `media_download_failed` | worker | a listed object could not be downloaded (storage.md §5) |
 | `DeciderError: <message>` / `VisionError: <message>` | worker | an adapter raised a `ModelError` subclass; `<message>` is the adapter's own message, which never contains keys, signed URLs, model output or post content (interfaces.md §2) |
 | `internal_error: <ExceptionType>` | worker | any other per-post exception — only the class name, e.g. `internal_error: KeyError` |
