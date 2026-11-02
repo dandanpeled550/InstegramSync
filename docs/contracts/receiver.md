@@ -4,7 +4,8 @@
   permanent classification and a placeholder row, verify-token digest compare and length floor, malformed
   `Content-Length`, `HEAD`/`OPTIONS`, extended test table · round 3: trimmed secrets used for HMAC and
   digest, class `54` and `PGRST102` permanent, lone-surrogate tests, alerting on repeated codes, placeholder
-  `sqlstate` regex
+  `sqlstate` regex · round 4: a failed placeholder insert is transient unless class `23`/`54`, alert on any
+  `placeholder_rejected`, "trim" is `String.prototype.trim()`
 - Implemented by `receiver-engineer` in `supabase/functions/ig-webhook/` (Deno / TypeScript).
 - **Binding from the M1 receiver v0** (the spike build), not only from M2. Every rule here holds for any
   deployed `ig-webhook`, whatever else it does yet. A receiver PR that skips one fails security review.
@@ -27,6 +28,11 @@ Supabase secrets, per project (`supabase secrets set …`, never in git; `.env.e
 | `META_APP_SECRET` | non-empty after trimming | HMAC key for `X-Hub-Signature-256` |
 | `META_VERIFY_TOKEN` | **at least 32 characters** after trimming; generated, e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"` (43 characters) | GET handshake |
 | `ALLOWED_SENDER_IDS` | comma-separated list; items trimmed, empty items ignored; **at least one item, and every item matches `^[0-9]+$`** | sender allowlist |
+
+**Trimming** always means JavaScript `String.prototype.trim()`: it removes leading and trailing whitespace
+and line terminators as ECMAScript defines them (ASCII space, tab, CR, LF, VT, FF, and Unicode spaces such
+as U+00A0 and U+FEFF), and nothing else. The same function is used for all three variables and for each
+`ALLOWED_SENDER_IDS` item. "Characters" in a length rule means the trimmed string's `.length`.
 
 **The trimmed value is the value.** After validation the function uses the trimmed string of
 `META_APP_SECRET` and `META_VERIFY_TOKEN` everywhere: the HMAC key (§4) and the verify-token digest (§4) are
@@ -169,11 +175,13 @@ Postgres's jsonb input (class 22, permanent), unless PostgREST's own JSON parser
 fixed by the integration test in §10, so a platform upgrade that changes it fails that test instead of
 silently turning a permanent rejection into a 36 h retry loop.
 
-**Alerting** (devops-engineer, M0.6): the same `insert_failed: <code>` in 3 or more requests within 1 hour
-alerts the owner (a transient error that keeps repeating is probably permanent and is looping on Meta's
-retries), and so does the same `insert_rejected: <code>` in 3 or more log lines within 1 hour (one input
-being rejected is bad input; every share being rejected is a bug, e.g. a bad migration). The thresholds are
-defaults that devops may tune in `ops/`; the log codes above are the contract.
+**Alerting** (devops-engineer, M0.6): the same `insert_failed: <code>` or `placeholder_failed: <code>` in 3 or
+more requests within 1 hour alerts the owner (a transient error that keeps repeating is probably permanent
+and is looping on Meta's retries), and so does the same `insert_rejected: <code>` in 3 or more log lines
+within 1 hour (one input being rejected is bad input; every share being rejected is a bug, e.g. a bad
+migration). **Any single `placeholder_rejected: <code>` alerts** (threshold 1, not tunable): it is the only
+case where a share leaves no row. The other thresholds are defaults that devops may tune in `ops/`; the log
+codes above are the contract.
 
 **Placeholder row** (permanent rejection only). So the owner sees that a share failed instead of it vanishing,
 the receiver inserts, with the same `on conflict (message_mid) do nothing`:
@@ -188,9 +196,22 @@ otherwise, including for `PGRST102`, it is the fixed string `"unknown"`. `raw_pa
 marker, never any part of the event. The worker's `parse()` raises
 `UnsupportedPayload("insert_rejected")` for it (interfaces.md §1), so the row ends `failed` with
 `unsupported_payload: insert_rejected` and shows up in the UI. A placeholder gets no background work (no media
-copy, no ack DM). If the placeholder insert itself fails, the same table applies: permanent → log
-`placeholder_rejected: <SQLSTATE>` and count as handled (the event is lost; the log line is the only trace);
-transient → `500`.
+copy, no ack DM).
+
+**If the placeholder insert itself fails**, the table above does **not** apply as is. The placeholder body is
+built by the receiver and known-good; only `message_mid` and `sender_id` come from the event. So a failure
+whose cause can't be those two values is not about this input, and is never treated as permanent:
+
+| Placeholder insert result | Outcome |
+|---|---|
+| A row is returned | handled (the original `insert_rejected: <code>` log line stays) |
+| No row returned (`on conflict` on `message_mid`: an earlier delivery already stored this `mid`) | duplicate, absorbed: handled, nothing else logged |
+| SQLSTATE class `23` (integrity, e.g. `23502` on `sender_id`) or class `54` (e.g. `54000`: the `mid` is too large to index) | **permanent**: log `placeholder_rejected: <SQLSTATE>`, count as handled. The event is lost and this log line is its only trace, so **every single** `placeholder_rejected` alerts (below) |
+| Anything else: transient errors from the table above, **and** `PGRST102`, class `22` and any other code the table calls permanent | **transient**: log `placeholder_failed: <SQLSTATE \| PGRST code \| HTTP status \| exception class>`, the response is `500` so Meta redelivers. Why: a `PGRST102` or class `22` on a body the receiver built means the client or platform is broken for every request (e.g. an empty or truncated body), not that this input is bad; treating it as permanent would silently lose every share until someone notices |
+
+The other events in the batch are unaffected either way (§6 "attempted independently"). Trade-off: if a
+`mid` itself ever caused a class `22` error (not expected, Meta generates it), the event loops on Meta's
+retries for up to 36 h and the `placeholder_failed` alert fires. That is accepted over a silent loss.
 
 - **Post-upload write (M2 media copy):** after all attachments of a post were attempted, **one** update sets
   `media_path` and `error` together, conditional on `status = 'received'` — exact statement, zero-rows meaning
@@ -234,7 +255,7 @@ error-status test also asserts an **empty body**, and the whole suite asserts th
 | Rule | Test |
 |---|---|
 | Fail closed | each of the three variables unset / `""` / `"  "` → `GET` and `POST` both `500`, zero DB calls, zero fetches. `ALLOWED_SENDER_IDS` = `","`, `"abc"`, `"123,*"` → `500`. `META_VERIFY_TOKEN` of 31 characters → `500`; 32 → accepted; 31 characters plus a trailing space or newline → `500` |
-| Trimmed secrets | `META_APP_SECRET="<secret>\n"`: a signature computed with key `<secret>` → `200`, one computed with `"<secret>\n"` → `403`. `META_VERIFY_TOKEN="  <token>\n"`: handshake with `<token>` → `200`; with `"  <token>\n"` (URL-encoded) → `403` |
+| Trimmed secrets | `META_APP_SECRET="<secret>\n"`: a signature computed with key `<secret>` → `200`, one computed with `"<secret>\n"` → `403`. `META_VERIFY_TOKEN="  <token>\n"`: handshake with `<token>` → `200`; with `"  <token>\n"` (URL-encoded) → `403`. Trim is `String.prototype.trim()`: `META_VERIFY_TOKEN="<token>\u00a0\ufeff"` → handshake with `<token>` → `200`; `ALLOWED_SENDER_IDS="\u00a01000000000000001\t"` → that sender is allowed; a 31-character token plus `\u00a0` → `500` |
 | Platform env | `SUPABASE_URL` or `SUPABASE_SERVICE_ROLE_KEY` unset / `""` → `GET` and `POST` `500`, empty body, zero DB calls, zero fetches |
 | Config per request | one handler instance: request 1 with valid env → `200`; set `ALLOWED_SENDER_IDS=""` → request 2 → `500`; restore → request 3 → `200`. Same with a changed `ALLOWED_SENDER_IDS` value: request 2 uses the new list |
 | Method | `PUT`, `HEAD`, `OPTIONS` (with `Origin` and `Access-Control-Request-Method`) → `405`, empty body, no `Access-Control-Allow-Origin` |
@@ -248,7 +269,7 @@ error-status test also asserts an **empty body**, and the whole suite asserts th
 | Shape | event without `message.mid` (e.g. a reaction) → not inserted, `200` |
 | Body ignored | valid signature + invalid JSON, invalid UTF-8, or `object: "page"` → `200`, zero inserts |
 | Dedupe | insert returns no row → no background work scheduled, `200` |
-| Permanent rejection | batch of 3 accepted events, the 2nd insert fails with SQLSTATE `22P05` → `200`; events 1 and 3 inserted and get background work; a placeholder row for event 2 with `raw_payload` = exactly the marker; log has `insert_rejected: 22P05` and no DB error message. Same with a class `23` code (`23502`), a class `54` code (`54000`) and `22P02`. HTTP `400` with code `PGRST102` → `200`, placeholder with `"sqlstate": "unknown"`, log `insert_rejected: PGRST102`. Placeholder insert also failing with `22P05` → `200`, log `placeholder_rejected: 22P05` |
+| Permanent rejection | batch of 3 accepted events, the 2nd insert fails with SQLSTATE `22P05` → `200`; events 1 and 3 inserted and get background work; a placeholder row for event 2 with `raw_payload` = exactly the marker; log has `insert_rejected: 22P05` and no DB error message. Same with a class `23` code (`23502`), a class `54` code (`54000`) and `22P02`. HTTP `400` with code `PGRST102` → `200`, placeholder with `"sqlstate": "unknown"`, log `insert_rejected: PGRST102`. Placeholder insert also failing (event 2 rejected with `22P05` first): with `23502` or `54000` → `200`, no row for event 2, log `placeholder_rejected: <code>`; with `PGRST102`, `22P05`, `08006` or a thrown network error → `500`, log `placeholder_failed: <code>`; in every case events 1 and 3 are still inserted and get background work, and no log line holds a DB error message. Placeholder insert returning no row (duplicate) → `200`, no `placeholder_*` log line |
 | Lone surrogate (unit) | a signed body whose caption text contains the escape `\ud800` (raw bytes) → passes step 5; the event handed to the fake DB client is unchanged (the caption string still holds U+D800). Fake returns `22P02` → placeholder, log `insert_rejected: 22P02`; fake returns HTTP `400` `PGRST102` → placeholder; fake returns HTTP `400` `PGRST100` → transient, `500`, no placeholder |
 | Lone surrogate (integration, test-engineer, `tests/integration/`, local `supabase start`, M1) | insert an event whose caption holds `\ud800` through the receiver's DB client against the pinned local stack; assert the **exact** observed outcome (expected `22P02`; or `PGRST102` if PostgREST rejects first) and that the receiver classifies it permanent and stores the placeholder. Record the observed code in the PR. If the stack stores the row instead (e.g. with U+FFFD), the test asserts that and no classification is needed. Same test with `\u0000` → expected `22P05` |
 | Transient failure | batch of 3, the 2nd insert fails with each of: thrown network error, HTTP `503`, SQLSTATE `08006`, `40001`, `53300`, `57014`, `42P01`, `PGRST301`, `PGRST100` → `500`; events 1 **and 3** still inserted and get background work; no placeholder |
