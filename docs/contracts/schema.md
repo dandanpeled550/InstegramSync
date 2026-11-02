@@ -1,7 +1,9 @@
 # Schema contract — v0
 
 - Version: v0.1 (M0.1b) · 2026-11-01 · owner: `architect` — v0.1 adds the migration role guard, the owner and
-  extension checks, the receiver media write and the exact PATCH statement (follow-ups from the PR #4 reviews)
+  extension checks, the receiver media write and the exact PATCH statement (follow-ups from the PR #4 reviews);
+  the read-only remote catalog check, CLI pin and connection rules from the migration-role research (PR #13
+  round 2)
 - Mirrors: `supabase/migrations/` (implemented by `data-engineer` in M0.5). Where this file and a migration
   disagree, the migration is a bug or this file needs an ADR — never silently "fix" one to match the other.
 - Source: [PLAN.md §6](../PLAN.md#6-store--supabase), [ADR 0001](../decisions/0001-supabase-receiver-laptop-worker.md).
@@ -16,8 +18,10 @@
 `with schema extensions` and reference the operator class as `extensions.gin_trgm_ops` if the migration's
 `search_path` does not include `extensions`. (`pg_cron` / `pg_net` arrive in M2 with their own migration.)
 
-**No extension lives in `public`.** Every `create extension` names `with schema extensions` (or the
-extension's own fixed schema). An extension in `public` would put RPC-callable functions on the PostgREST
+**No extension lives in `public`.** Every extension is created as
+`create extension if not exists <name> with schema extensions;` — or, when the extension's control file
+fixes its schema (e.g. M2's `pg_cron`, `pg_net`), with exactly that schema. A bare `create extension` is
+never used: where it lands depends on `search_path` ([research](../research/supabase-migration-role.md)). An extension in `public` would put RPC-callable functions on the PostgREST
 surface. `tests/db` asserts this (§5).
 
 ## 2. Tables
@@ -308,6 +312,11 @@ alter default privileges for role postgres revoke execute on functions from publ
                                                                                       -- entry can't remove it
 ```
 
+Every `alter default privileges` in any migration names `for role postgres` explicitly, never relying on the
+current role. Defaults are per creating role: these do not cover objects that Supabase's own `supabase_admin`
+creates (mainly extensions installed in `public`), which is one more reason no extension lives there
+([research](../research/supabase-migration-role.md)).
+
 The last statement is **global**. It removes the `PUBLIC` `EXECUTE` default from every function `postgres`
 creates later, in any schema, not only `public`. A later migration whose function must be callable by some
 role (e.g. M2's pg_cron / pg_net helpers) grants `EXECUTE` explicitly to exactly that role, and never to
@@ -340,7 +349,10 @@ instead of a fixed list, so an object added later without RLS or revokes fails t
   up in `public`, report it; never exclude it silently.
 - Every relation and function in `public` is owned by `postgres` (`pg_class.relowner` / `pg_proc.proowner`
   = `'postgres'::regrole`), so the default-privilege revokes above apply to it.
-- Every file in `supabase/migrations/` starts with the migration role guard (§6), checked by a file scan.
+- Every file in `supabase/migrations/` starts with the migration role guard (§6), checked by a file scan:
+  skipping only SQL comments and blank lines, the first statement is a `do` block containing the token
+  `current_user <> 'postgres'` (match the token, not the message).
+- `supabase/seed.sql` contains no `create`, `alter`, `drop`, `grant` or `revoke` (file scan; §6).
 - **Future objects:** inside a rolled-back transaction, as `postgres`, create a throwaway table, sequence,
   function and view in `public`; each role has no privilege on any of them (proves the default privileges).
   And no `pg_default_acl` entry of `defaclrole = 'postgres'` (global or for `public`) grants anything to
@@ -355,13 +367,26 @@ instead of a fixed list, so an object added later without RLS or revokes fails t
   with `status='received'`, a duplicate `message_mid` with `on conflict do nothing` inserts nothing, and each
   named `check` constraint in §2.2 rejects one out-of-range value.
 
-**Remote check after every deploy.** Locally these tests run against `supabase db reset`. The read-only
-catalog assertions above (privileges, RLS, view options, function `EXECUTE`, `pg_default_acl`, policies,
-extensions, owners; not the throwaway-object probe or the per-CRUD role tests) also run against **staging**
-after every CI `db push`, and any finding fails the deploy. Production gets the same check after its deploy.
-devops-engineer implements this in M0.6 and reuses data-engineer's queries (e.g. a `tests/db` marker that
-targets the deployed database). It closes the gap where the remote migration role differs, gets Supabase's
-default grants, and the local tests still pass.
+**Remote check after every deploy.** Locally these tests run against `supabase db reset`. Against a remote
+database a separate, smaller check runs after every CI `db push` to **staging** (required; any finding fails
+the deploy) and, optionally, to **production** after its deploy (tech-lead decides whether M0.6 includes it).
+Rules for that check:
+- It is **read-only SQL in devops-owned code** (e.g. `scripts/check-remote-privileges.sql`, run by the deploy
+  workflow), owned and reviewed by devops-engineer. It is **never** `tests/db` or a pytest marker on it, so
+  editing data-engineer's local suite can never change the deploy gate.
+- It contains only `select`s over the catalog that mirror these assertions from the list above: table /
+  view privileges, `relrowsecurity`, view `security_invoker`, sequence privileges, function `EXECUTE`, no
+  extension in `public`, owners, `pg_default_acl` entries of `postgres`, no policies. **No DDL or DML probe**
+  against a remote database: not the throwaway-object check, not the per-role CRUD tests, not
+  `nextval`. The query result is a list of findings; empty = pass.
+- It connects with a **read-only login** (a role with `CONNECT` and catalog read only, no table rights), held
+  in an environment-scoped GitHub secret, not the `postgres` password. `has_*_privilege()`, `pg_class`,
+  `pg_proc`, `pg_extension`, `pg_policies` and `pg_default_acl` are readable by any role. Creating that role is
+  a human step in the dashboard (devops documents it); until it exists, devops may use the deploy
+  credential, flagged as an open issue.
+
+It closes the gap where the remote migration role differs, gets Supabase's default grants, and the local
+tests still pass. It is also the backstop for CLI role drift inside a migration file (§6).
 
 Adding a policy to any table later is a contract change (ADR + update to this table + a test for exactly
 that policy). Storage RLS is specified in [storage.md §3](storage.md#3-access).
@@ -379,25 +404,54 @@ staging/production are migrated by CI only ([AGENTS_PLAN §15.6](../AGENTS_PLAN.
 3. **Contract** — only in a later release, once no deployed code reads the old shape: drop old columns,
    narrow constraints. Drops and other destructive SQL need an ADR and human approval.
 
-**Migration role guard.** This is the first statement of **every** migration file:
+**Migration role guard.** This is the first statement of **every** migration file (only comments and blank
+lines may come before it). Canonical text:
 
 ```sql
 do $$
 begin
   if current_user <> 'postgres' then
-    raise exception 'migrations must run as postgres (current_user is %)', current_user;
+    raise exception 'migration must run as postgres, got current_user=% (session_user=%)',
+      current_user, session_user;
   end if;
 end $$;
 ```
 
+The file scan in `tests/db` (§5) matches the token `current_user <> 'postgres'` inside the first statement,
+**not** the exception message, so a later wording change in this contract never breaks applied migrations
+(which can't be edited).
+
 Why `current_user` and not `session_user`: new objects are owned by the current role, and default privileges
-are keyed on it. Expected behaviour (medium confidence; Supabase CLI behaviour, not re-checked against its
-docs here): local `supabase db reset` connects as `postgres`. Remote `supabase db push` either connects as
-`postgres` (`--db-url`), or, when linked, logs in with a temporary CLI login role and runs
-`set role postgres`. In every case `current_user = 'postgres'` while `session_user` may differ, so the guard
-passes. If this is wrong, the first staging `db push` fails loudly before it creates anything, which is the
-intended outcome. Report it. The fix is a contract change (e.g. add the default-privilege revokes for that
-role); removing the guard is never the fix.
+are keyed on it. Behaviour per [research: migration role](../research/supabase-migration-role.md) (Supabase
+CLI v2.122.0 source):
+- Local `supabase start` / `db reset` connects as `postgres` (medium confidence).
+- Remote `supabase db push` with `SUPABASE_DB_PASSWORD` (the CI deploy path, M0.6) or `--db-url` as
+  `postgres` connects as `postgres`; both users are `postgres` (high).
+- Remote `db push --linked` without a password logs in as the temporary role `cli_login_postgres` and runs
+  `set session role postgres`, so `current_user = 'postgres'` while `session_user = 'cli_login_postgres'`
+  (high). The guard passes; `session_user` in the message only helps diagnosis.
+- The GitHub integration / branching role is undocumented (low). Staging and production are migrated by CI
+  `db push` only; if that ever changes, test the guard on a throwaway branch first.
+
+Do not weaken the guard to `pg_has_role(current_user, 'postgres', 'member')` (it passes for a
+`cli_login_postgres` that was never stepped down, which would then own the objects), and never add
+`set role postgres` inside a migration to "fix" it (that hides a misconfigured CLI). If the guard fires, the
+`db push` fails before the file creates anything (each file runs as one transaction), which is the intended
+outcome. Report it. The fix is a contract change; removing the guard is never the fix.
+
+**CLI and connection rules** (devops-engineer, `ci/migrations` and both deploy workflows):
+- Pin `supabase/setup-cli` to exactly **v2.122.0** (the version the research read), never `latest` and never
+  a range such as "≥ v2.90.0". v2.122.0 contains the two fixes the step-down depends on: `b08e6e1f` (re-run
+  the step-down on every new connection) and `0c721790` (restore `postgres` after `RESET ROLE` / at the end of
+  each file). Raising the pin is a contract change that re-checks both.
+- Deploy with `SUPABASE_DB_PASSWORD` (direct host or the CLI's own pooler config, which uses session mode on
+  port 5432). Never a hand-built `--db-url` on pooler port **6543** (transaction mode does not keep
+  session-level `set session role`).
+- Migrations never contain `reset role`, `set role` or `discard all`.
+
+**`seed.sql` creates no objects.** It only inserts synthetic rows into tables the migrations created (e.g.
+the `app_secrets` dev value, §2.3). Anything that creates or alters an object goes in a migration, behind the
+guard.
 
 Also:
 - No extension in `public` (§1). Every new table, view, sequence and function follows the §5 rules (RLS +
