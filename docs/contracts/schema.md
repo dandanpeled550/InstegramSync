@@ -4,7 +4,8 @@
   extension checks, the receiver media write and the exact PATCH statement (follow-ups from the PR #4 reviews);
   the read-only remote catalog check, CLI pin and connection rules from the migration-role research (PR #13
   round 2) · round 3: read-only login attributes, `seed.sql` scan matching, CLI `version:` input vs action
-  SHA, placeholder `sqlstate` may be `unknown`
+  SHA, placeholder `sqlstate` may be `unknown` · round 4: `seed.sql` scan is one left-to-right tokenizer,
+  read-only login also asserts its `pg_roles` attributes
 - Mirrors: `supabase/migrations/` (implemented by `data-engineer` in M0.5). Where this file and a migration
   disagree, the migration is a bug or this file needs an ADR — never silently "fix" one to match the other.
 - Source: [PLAN.md §6](../PLAN.md#6-store--supabase), [ADR 0001](../decisions/0001-supabase-receiver-laptop-worker.md).
@@ -353,14 +354,58 @@ instead of a fixed list, so an object added later without RLS or revokes fails t
 - Every file in `supabase/migrations/` starts with the migration role guard (§6), checked by a file scan:
   skipping only SQL comments and blank lines, the first statement is a `do` block containing the token
   `current_user <> 'postgres'` (match the token, not the message).
-- `supabase/seed.sql` creates no objects (§6), checked by a file scan. First remove `--` line comments,
-  `/* … */` block comments and single-quoted string literals (with `''` escapes). Then: (a) the text has no
-  dollar quote (`$$` or `$tag$`); (b) every statement (split on `;`) starts with `insert into`; (c) none of
-  the keywords `create`, `alter`, `drop`, `grant`, `revoke`, `truncate`, `execute`, `copy`, `set role`,
-  `reset role` appears (a `do` block is already excluded by (a) and (b)). Keywords match
-  **case-insensitively on word boundaries** (`\bcreate\b`), so `created_at` or a literal `'created by seed'`
-  never trip it, while `on conflict do nothing` is allowed. Scan tests: `CREATE TABLE x()` → flagged; `-- never create objects here` → passes;
-  `insert … values ('drop me')` → passes; `do $$ begin execute 'create table t()'; end $$;` → flagged.
+- `supabase/seed.sql` creates no objects (§6), checked by a file scan in **one left-to-right pass** (a
+  tokenizer, never a sequence of regex replacements: separate passes in the wrong order let a quote inside a
+  `--` comment open a fake literal, and a greedy `/\*.*\*/` hides everything between the first and last
+  comment). The scan assumes Postgres defaults (`standard_conforming_strings = on`). States, starting in
+  *code*:
+  - *code*: `--` starts a line comment; `/*` starts a block comment; `'` starts a string literal; `"` starts
+    a quoted identifier; `;` ends a statement; every other character is kept as code.
+  - *line comment*: ends at the next `\n` **or `\r`** (Postgres ends it at either), or at end of file.
+    Replaced by one space.
+  - *block comment*: nests like Postgres (`/*` inside adds a level, `*/` removes one); ends when the level is
+    back to 0. Replaced by one space. End of file inside it → **scan fails**.
+  - *string literal*: `''` is an escaped quote; the next lone `'` ends it. A backslash is an ordinary
+    character. Replaced by `''` (an empty literal). End of file inside it → **scan fails**.
+  - *quoted identifier*: `""` is an escaped quote; the next lone `"` ends it. Replaced by `x`. End of file
+    inside it → **scan fails**.
+  - **Always rejected** (scan fails): a `'` or `"` that opens a literal or identifier right after `E`/`e`
+    (an escape string, where `\'` is a quote) or after `U&`/`u&` (Unicode escapes), when the code character
+    before that `E`/`U` (after comments were replaced) is not a letter, digit or `_`, or there is none; and **any `$` in code** (this covers `$$` and `$tag$`
+    dollar quotes; `$` inside a literal is fine). Seed data never needs any of them.
+
+  Then, on the code that is left: split on `;` and **skip statements that are empty or whitespace-only**
+  (the piece after the last `;`, a comment-only file). Every remaining statement starts with `insert into`,
+  and none of these words appears: `create`, `alter`, `drop`, `grant`, `revoke`, `truncate`, `execute`,
+  `copy`, `set role`, `reset role`, `set_config`. Words match **case-insensitively on word boundaries**
+  (`\bcreate\b`), so `created_at` or a literal `'created by seed'` never trip it, while
+  `on conflict do nothing` is allowed. `set_config` is banned because a call inside an `insert` can change
+  the session for later statements (`role`, or `standard_conforming_strings`, which would change how the
+  rest of the file is lexed). `seed.sql` runs only locally (`supabase db reset`; `db push` never runs it),
+  so this scan is a guard against objects created by accident, not a sandbox.
+
+  Scan tests, one per rule:
+
+  | Input | Result |
+  |---|---|
+  | `CREATE TABLE x()` | flagged (not `insert into`, banned word) |
+  | `-- never create objects here` (the whole file) | passes (comment-only file, empty statement skipped) |
+  | `insert into t values ('drop me');` + trailing newline and spaces | passes (literal stripped, trailing empty statement skipped) |
+  | `insert into t values ('it''s');` | passes |
+  | `insert into t values ('costs $5');` | passes (`$` inside a literal) |
+  | `do $$ begin execute 'create table t()'; end $$;` | flagged (`$` in code) |
+  | `insert into t values (E'\''); create table evil(); insert into t values ('x');` | flagged (escape string) |
+  | `insert into t values (U&'\0041');` | flagged (Unicode escape string) |
+  | `insert into t select 1 as "a'b"; create table evil(); insert into t select 2 as "c'd";` | flagged (`create` is visible once the identifiers are stripped) |
+  | `-- it's a note` newline `create table t();` | flagged (the `'` in the comment opens nothing) |
+  | `-- note` + `\r` (CR only) + `create table t();` | flagged (CR ends a line comment) |
+  | `insert into t values (/**/E'x');` | flagged (escape string after a comment) |
+  | `insert into t values ('unterminated);` | flagged (end of file inside a literal) |
+  | `insert into t values (1); /* unterminated` | flagged (end of file inside a comment) |
+  | `insert into t values ("x);` | flagged (end of file inside a quoted identifier) |
+  | `/* a /* b */ create table t(); */ insert into t values (1);` | passes (nested comment, as Postgres reads it) |
+  | `insert into t values (set_config('role', 'x', false));` | flagged (`set_config`) |
+  | `insert into posts (created_at, note) values (now(), 'created by seed') on conflict do nothing;` | passes (word boundaries; `do` is allowed) |
 - **Future objects:** inside a rolled-back transaction, as `postgres`, create a throwaway table, sequence,
   function and view in `public`; each role has no privilege on any of them (proves the default privileges).
   And no `pg_default_acl` entry of `defaclrole = 'postgres'` (global or for `public`) grants anything to
@@ -397,9 +442,13 @@ Rules for that check:
   Creating that role is a human step in the dashboard (devops documents it); until it exists, devops may use
   the deploy credential, flagged as an open issue.
 - The check always runs inside `begin transaction read only`, whatever the credential. With the read-only
-  login its first query also asserts the login itself: `current_setting('default_transaction_read_only') =
-  'on'` and no `pg_auth_members` row with it as `member`; otherwise the check fails. With the interim deploy
-  credential that assertion is skipped and the run output says so.
+  login its first query also asserts the login itself, and the check fails otherwise:
+  `current_setting('default_transaction_read_only') = 'on'`; no `pg_auth_members` row with it as `member`;
+  and its `pg_roles` row (`rolname = current_user`) has `rolsuper`, `rolbypassrls`, `rolcreaterole`,
+  `rolcreatedb`, `rolreplication` and `rolinherit` all false. `default_transaction_read_only` (and
+  `begin transaction read only`) can be changed by the session itself, so they are **drift detection, not a
+  boundary**; the boundary is that the login has no privileges and no memberships. With the interim deploy
+  credential the login assertion is skipped and the run output says so.
 
 It closes the gap where the remote migration role differs, gets Supabase's default grants, and the local
 tests still pass. It is also the backstop for CLI role drift inside a migration file (§6).
