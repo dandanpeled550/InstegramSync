@@ -14,6 +14,7 @@ throwaway repo per test so branch-protection checks never touch this repo's real
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -64,12 +65,17 @@ def run_hook(
     data: dict[str, Any],
     cwd: Path | None = None,
     raw_stdin: str | None = None,
+    extra_path: Path | None = None,
 ) -> subprocess.CompletedProcess:
     hook_path = repo / ".claude" / "hooks" / hook_name
+    env = None
+    if extra_path is not None:
+        env = {**os.environ, "PATH": f"{extra_path}:{os.environ.get('PATH', '')}"}
     return subprocess.run(
         [sys.executable, str(hook_path)],
         input=raw_stdin if raw_stdin is not None else json.dumps(data),
         cwd=str(cwd or repo),
+        env=env,
         check=False,
         capture_output=True,
         text=True,
@@ -80,6 +86,29 @@ def run_hook(
 def write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data))
+
+
+def write_fake_gh(
+    bin_dir: Path, base_ref: str = "dev", files: tuple[str, ...] = ()
+) -> None:
+    """A stand-in for the `gh` CLI, for tests that need git-guard.py's `gh pr view` lookups to
+    resolve to canned data instead of making a real network call."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    script = bin_dir / "gh"
+    files_block = "\n".join(files)
+    script.write_text(
+        f"""#!/usr/bin/env bash
+case "$*" in
+  *"--json baseRefName"*) echo "{base_ref}" ;;
+  *"--json files"*) cat <<'FILES_EOF'
+{files_block}
+FILES_EOF
+    ;;
+  *) exit 1 ;;
+esac
+"""
+    )
+    script.chmod(0o755)
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -380,6 +409,166 @@ def test_git_guard_allows_human_tasks_readonly_commands(hook_repo: Path) -> None
             "cwd": str(hook_repo),
             "tool_input": {"command": "gh pr list"},
         },
+    )
+    assert r.returncode == 0, r.stderr
+
+
+# Q2 (docs/tasks/M0.md): agents share one gh identity, so these guard against one agent forging
+# another's review verdict, dodging the security gate, or merging a change to its own guardrails.
+
+
+def test_git_guard_blocks_forged_code_review_status(hook_repo: Path) -> None:
+    r = run_hook(
+        hook_repo,
+        "git-guard.py",
+        {
+            "agent_type": "pipeline-engineer",
+            "cwd": str(hook_repo),
+            "tool_input": {
+                "command": (
+                    "gh api repos/o/r/statuses/abc123 -f state=success "
+                    "-f context=agent-review/code -f description=lgtm"
+                )
+            },
+        },
+    )
+    assert r.returncode == 2
+    assert "code-reviewer" in r.stderr
+
+
+def test_git_guard_allows_code_reviewer_to_set_its_own_status(hook_repo: Path) -> None:
+    r = run_hook(
+        hook_repo,
+        "git-guard.py",
+        {
+            "agent_type": "code-reviewer",
+            "cwd": str(hook_repo),
+            "tool_input": {
+                "command": (
+                    "gh api repos/o/r/statuses/abc123 -f state=success "
+                    "-f context=agent-review/code -f description=lgtm"
+                )
+            },
+        },
+    )
+    assert r.returncode == 0, r.stderr
+
+
+def test_git_guard_blocks_forged_security_review_status(hook_repo: Path) -> None:
+    r = run_hook(
+        hook_repo,
+        "git-guard.py",
+        {
+            "agent_type": "tech-lead",
+            "cwd": str(hook_repo),
+            "tool_input": {
+                "command": (
+                    "gh api repos/o/r/statuses/abc123 -f state=success "
+                    "-f context=agent-review/security -f description=lgtm"
+                )
+            },
+        },
+    )
+    assert r.returncode == 2
+    assert "security-reviewer" in r.stderr
+
+
+def test_git_guard_blocks_security_label_removal_by_other_agents(
+    hook_repo: Path,
+) -> None:
+    r = run_hook(
+        hook_repo,
+        "git-guard.py",
+        {
+            "agent_type": "tech-lead",
+            "cwd": str(hook_repo),
+            "tool_input": {"command": "gh pr edit 9 --remove-label security"},
+        },
+    )
+    assert r.returncode == 2
+    assert "security-reviewer" in r.stderr
+
+
+def test_git_guard_allows_security_reviewer_to_remove_security_label(
+    hook_repo: Path,
+) -> None:
+    r = run_hook(
+        hook_repo,
+        "git-guard.py",
+        {
+            "agent_type": "security-reviewer",
+            "cwd": str(hook_repo),
+            "tool_input": {"command": "gh pr edit 9 --remove-label security"},
+        },
+    )
+    assert r.returncode == 0, r.stderr
+
+
+def test_git_guard_allows_unrelated_label_edits(hook_repo: Path) -> None:
+    r = run_hook(
+        hook_repo,
+        "git-guard.py",
+        {
+            "agent_type": "tech-lead",
+            "cwd": str(hook_repo),
+            "tool_input": {"command": "gh pr edit 9 --remove-label needs-triage"},
+        },
+    )
+    assert r.returncode == 0, r.stderr
+
+
+def test_git_guard_blocks_merging_pr_that_touches_claude_dir(hook_repo: Path) -> None:
+    bin_dir = hook_repo / "fakebin"
+    write_fake_gh(
+        bin_dir, base_ref="dev", files=(".claude/hooks/git-guard.py", "README.md")
+    )
+    r = run_hook(
+        hook_repo,
+        "git-guard.py",
+        {
+            "agent_type": "tech-lead",
+            "cwd": str(hook_repo),
+            "tool_input": {"command": "gh pr merge 9 --squash --delete-branch"},
+        },
+        extra_path=bin_dir,
+    )
+    assert r.returncode == 2
+    assert ".claude" in r.stderr
+
+
+def test_git_guard_blocks_merging_pr_that_touches_workflows(hook_repo: Path) -> None:
+    bin_dir = hook_repo / "fakebin"
+    write_fake_gh(bin_dir, base_ref="dev", files=(".github/workflows/pr-checks.yml",))
+    r = run_hook(
+        hook_repo,
+        "git-guard.py",
+        {
+            "agent_type": "tech-lead",
+            "cwd": str(hook_repo),
+            "tool_input": {"command": "gh pr merge 9 --squash --delete-branch"},
+        },
+        extra_path=bin_dir,
+    )
+    assert r.returncode == 2
+    assert ".github/workflows" in r.stderr
+
+
+def test_git_guard_allows_merging_pr_with_no_sensitive_files(hook_repo: Path) -> None:
+    bin_dir = hook_repo / "fakebin"
+    write_fake_gh(
+        bin_dir,
+        base_ref="dev",
+        files=("backend/app/process.py", "tests/pipeline/test_x.py"),
+    )
+    r = run_hook(
+        hook_repo,
+        "git-guard.py",
+        {
+            "agent_type": "tech-lead",
+            "cwd": str(hook_repo),
+            "tool_input": {"command": "gh pr merge 9 --squash --delete-branch"},
+        },
+        extra_path=bin_dir,
     )
     assert r.returncode == 0, r.stderr
 
