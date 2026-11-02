@@ -56,13 +56,23 @@ See the `Makefile` (`make help`) and `.env.example`.
 
 ### Local Supabase exposes ports on all interfaces
 
-Supabase CLI 2.122.0 publishes the local stack's ports on all network interfaces, not just localhost.
-Studio has no login and the local demo keys are well known, so anyone on your network (cafe wifi) could
-reach your local database. Bind Docker to localhost: Docker Desktop, Settings, Docker Engine, add
-`"ip": "127.0.0.1"` to the JSON, then Apply and restart. Verify after `supabase start`:
+The local Supabase stack (CLI 2.122.0) publishes its ports on all network interfaces, not just localhost:
+54321 (API), 54322 (Postgres), 54323 (Studio, no login) and 54324 (Mailpit). The local demo keys are well
+known, so anyone on the same network could reach your local database. On Docker Desktop for Mac the
+listener is Docker Desktop's own proxy (`com.docker.backend`), so neither Docker's `"ip"` setting nor
+network options change it (verified 2026-11-02, Docker Desktop 4.54.0).
+
+What to do instead:
+
+- Run the stack only on trusted networks, and run `supabase stop` when you are done.
+- Keep only synthetic data in the local database.
+- Optional, untested: block incoming connections for Docker in the macOS firewall (System Settings,
+  Network, Firewall, Options).
+
+See what is actually exposed:
 
 ```sh
-lsof -iTCP -sTCP:LISTEN | grep -E '5432[0-9]'   # every line should show 127.0.0.1 or localhost, not *
+lsof -nP -iTCP -sTCP:LISTEN | grep -E ':5432[0-9]'   # "*:5432x" means all interfaces
 ```
 
-Keep only synthetic data in the local database.
+On Linux use `sudo lsof -nP -iTCP -sTCP:LISTEN` or `ss -ltn`.
