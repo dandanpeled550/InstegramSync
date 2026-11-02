@@ -28,6 +28,7 @@
       "Bash(gh pr merge*)",
       "Bash(gh api *protection*)",
       "Bash(gh api *rulesets*)",
+      "Bash(gh api graphql*)",
       "Bash(git tag*)",
       "Bash(git push --tags*)"
     ],

@@ -20,7 +20,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _common import PROTECTED_BRANCHES, block, current_branch, project_dir, read_input
+from _common import (
+    PROTECTED_BRANCHES,
+    block,
+    current_branch,
+    path_allowed,
+    project_dir,
+    read_input,
+)
 
 RESTRICTED_SHELL = {
     "researcher": {"git", "gh", "cd"},
@@ -68,6 +75,13 @@ SHELLS = {"bash", "sh", "zsh"}
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 ENV_TOKEN = re.compile(r"(^|/)\.env(\.[A-Za-z0-9_-]+)?$")
 APPROVAL_PATHS = (".claude/approvals", ".claude/bin/approve")
+# Q2 (docs/tasks/M0.md): all agents share one `gh` identity, so only this hook stops one agent from
+# forging another's review verdict, dodging the security gate, or merging a change to its own guardrails.
+REVIEW_CONTEXT_OWNER = {
+    "agent-review/code": "code-reviewer",
+    "agent-review/security": "security-reviewer",
+}
+SENSITIVE_MERGE_PATHS = (".github/workflows/**", ".claude/**")
 GIT_GLOBAL_WITH_ARG = {
     "-C",
     "-c",
@@ -297,6 +311,12 @@ class Guard:
             or (group == "repo" and action in {"delete", "edit", "rename", "archive"})
         ):
             self.deny(f"`gh {group} {action}` is a human gate.")
+
+        if group == "api":
+            self.check_gh_api(rest)
+        if group == "pr" and action == "edit":
+            self.check_pr_edit(rest)
+
         if group != "pr" or action != "merge":
             return
         if self.agent != "tech-lead":
@@ -313,6 +333,67 @@ class Guard:
             self.deny("couldn't confirm the PR's base branch; merge refused.")
         if base == "main":
             self.deny("only the human merges into main.")
+        files = self.pr_files(pr)
+        if files is None:
+            self.deny("couldn't confirm the PR's changed files; merge refused.")
+        if any(path_allowed(f, SENSITIVE_MERGE_PATHS) for f in files):
+            self.deny(
+                "PRs touching .github/workflows/** or .claude/** need a human to merge — agents never "
+                "merge changes to their own guardrails or CI (Q2, docs/tasks/M0.md)."
+            )
+
+    def check_gh_api(self, rest: list[str]) -> None:
+        context = next(
+            (a.split("=", 1)[1] for a in rest if a.startswith("context=")), None
+        )
+        if context is None:
+            return
+        owner = REVIEW_CONTEXT_OWNER.get(context)
+        if owner is not None and self.agent != owner:
+            self.deny(f"only {owner} may set the '{context}' status.")
+
+    def check_pr_edit(self, rest: list[str]) -> None:
+        i = 0
+        while i < len(rest):
+            tok = rest[i]
+            if tok == "--remove-label" and i + 1 < len(rest):
+                value, i = rest[i + 1], i + 2
+            elif tok.startswith("--remove-label="):
+                value, i = tok.split("=", 1)[1], i + 1
+            else:
+                i += 1
+                continue
+            labels = {label.strip() for label in value.split(",")}
+            if "security" in labels and self.agent != "security-reviewer":
+                self.deny(
+                    "only security-reviewer may remove the 'security' label (Q2, docs/tasks/M0.md)."
+                )
+
+    def pr_files(self, pr: str | None) -> list[str] | None:
+        cmd = [
+            "gh",
+            "pr",
+            "view",
+            *([pr] if pr else []),
+            "--json",
+            "files",
+            "-q",
+            ".files[].path",
+        ]
+        try:
+            r = subprocess.run(
+                cmd,
+                check=False,
+                cwd=str(self.cwd),
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except Exception:  # noqa: BLE001 — best effort, see module docstring
+            return None
+        if r.returncode != 0:
+            return None
+        return [line for line in r.stdout.splitlines() if line]
 
     def pr_base(self, pr: str | None) -> str | None:
         cmd = [
