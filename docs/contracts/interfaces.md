@@ -1,7 +1,8 @@
 # Interfaces contract — v0
 
 - Version: v0.1 (M0.1b) · 2026-11-01 · owner: `architect` — v0.1: `PERMALINK_RE.fullmatch`, no `RUBRIC`
-  default, `no_evidence` ⇔ empty `stages`, partial listing = no media
+  default, `no_evidence` ⇔ empty `stages`, partial listing = no media; round 2: `parse()` maps the
+  receiver's placeholder to `UnsupportedPayload("insert_rejected")`
 - Source: [PLAN.md §2–§5](../PLAN.md), [ADR 0002](../decisions/0002-staged-cascade-with-jev.md).
 - The Python below is the **contract** (names, fields, types, docstrings, error behavior). Builders implement
   it in the modules named; bodies shown as `...` are theirs to write.
