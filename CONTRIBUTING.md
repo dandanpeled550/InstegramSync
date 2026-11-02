@@ -52,4 +52,17 @@ or `security-gate.yml` gets `security-reviewer` and a human flag.
 
 ## Local setup
 
-Added in M0 by `devops-engineer` — see the `Makefile` and `.env.example` once they exist.
+See the `Makefile` (`make help`) and `.env.example`.
+
+### Local Supabase exposes ports on all interfaces
+
+Supabase CLI 2.122.0 publishes the local stack's ports on all network interfaces, not just localhost.
+Studio has no login and the local demo keys are well known, so anyone on your network (cafe wifi) could
+reach your local database. Bind Docker to localhost: Docker Desktop, Settings, Docker Engine, add
+`"ip": "127.0.0.1"` to the JSON, then Apply and restart. Verify after `supabase start`:
+
+```sh
+lsof -iTCP -sTCP:LISTEN | grep -E '5432[0-9]'   # every line should show 127.0.0.1 or localhost, not *
+```
+
+Keep only synthetic data in the local database.

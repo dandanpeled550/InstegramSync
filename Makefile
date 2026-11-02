@@ -6,6 +6,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
 HAS_BACKEND  := $(wildcard backend/pyproject.toml)
+LINT_TESTS := $(if $(wildcard tests),tests,)
 HAS_FRONTEND := $(wildcard frontend/package.json)
 HAS_FUNCTIONS := $(shell find supabase/functions -name '*.ts' -not -path '*/node_modules/*' 2>/dev/null | head -1)
 
@@ -36,7 +37,8 @@ endif
 
 lint: ## Lint and format-check everything that exists
 ifneq ($(HAS_BACKEND),)
-	cd backend && uv run ruff check . && uv run ruff format --check .
+	uv run --project backend ruff check --config backend/pyproject.toml backend $(LINT_TESTS)
+	uv run --project backend ruff format --check --config backend/pyproject.toml backend $(LINT_TESTS)
 else
 	@echo "lint: no backend/ yet, skipping python"
 endif
@@ -49,7 +51,8 @@ endif
 
 fmt: ## Auto-format
 ifneq ($(HAS_BACKEND),)
-	cd backend && uv run ruff check --fix . && uv run ruff format .
+	uv run --project backend ruff check --fix --config backend/pyproject.toml backend $(LINT_TESTS)
+	uv run --project backend ruff format --config backend/pyproject.toml backend $(LINT_TESTS)
 endif
 ifneq ($(HAS_FUNCTIONS),)
 	deno fmt supabase/functions
