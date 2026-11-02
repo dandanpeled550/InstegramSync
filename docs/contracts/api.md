@@ -5,7 +5,8 @@
   rate-limit wording, `insta_saver_session` cookie, single session key, in-process `rerun_requested`
   · round 2: Vite `cors: false`, `preview.*`, `127.0.0.1` dev host, cookie residual risk, async handlers for
   `rerun_requested` · round 3: Vite exact pin on a supported major maintained by Dependabot + `npm audit`
-  (replaces the 6.0.9 floor), tests for the background task's final step
+  (replaces the 6.0.9 floor), tests for the background task's final step · round 4: CI installs with
+  `npm ci` from the committed lockfile
 - Implemented by `web-engineer` (FastAPI, `backend/app/api/**`, served by `python -m app.serve` on
   `http://127.0.0.1:8000`, also reachable as `http://localhost:8000`); consumed by the Vite/React SPA served
   from the same origin. The network boundary (§1.1) and auth (§1.2) rules are normative.
@@ -99,7 +100,9 @@ contract change.
     that means 7.3.7+ or 8.3.3+, per the PR #13 security review). These numbers are an example, not a floor: the
     pin is **maintained by Dependabot** (devops-engineer adds the `npm` ecosystem for `frontend/` to
     `.github/dependabot.yml`) and checked by `npm audit --audit-level=moderate` in CI, which fails on any
-    advisory against the pinned version. The restricted CORS default and host check this file relies on
+    advisory against the pinned version. `frontend/package-lock.json` is committed and CI installs with
+    `npm ci` (never `npm install`), so the audit and the build see exactly the locked tree, including
+    transitive dependencies. The restricted CORS default and host check this file relies on
     arrived in 6.0.9 (CVE-2025-24010); later advisories (e.g. `server.fs.deny` bypasses, dev-server file read)
     are why an old pin is not enough. web-engineer chooses the version; devops-engineer adds it after human
     approval of the dependency.
