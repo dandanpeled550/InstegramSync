@@ -2,7 +2,9 @@
 
 - Version: v0 (M0.1b) · 2026-11-02 · owner: `architect` — round 2: per-event insert with transient /
   permanent classification and a placeholder row, verify-token digest compare and length floor, malformed
-  `Content-Length`, `HEAD`/`OPTIONS`, extended test table
+  `Content-Length`, `HEAD`/`OPTIONS`, extended test table · round 3: trimmed secrets used for HMAC and
+  digest, class `54` and `PGRST102` permanent, lone-surrogate tests, alerting on repeated codes, placeholder
+  `sqlstate` regex
 - Implemented by `receiver-engineer` in `supabase/functions/ig-webhook/` (Deno / TypeScript).
 - **Binding from the M1 receiver v0** (the spike build), not only from M2. Every rule here holds for any
   deployed `ig-webhook`, whatever else it does yet. A receiver PR that skips one fails security review.
@@ -25,6 +27,12 @@ Supabase secrets, per project (`supabase secrets set …`, never in git; `.env.e
 | `META_APP_SECRET` | non-empty after trimming | HMAC key for `X-Hub-Signature-256` |
 | `META_VERIFY_TOKEN` | **at least 32 characters** after trimming; generated, e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"` (43 characters) | GET handshake |
 | `ALLOWED_SENDER_IDS` | comma-separated list; items trimmed, empty items ignored; **at least one item, and every item matches `^[0-9]+$`** | sender allowlist |
+
+**The trimmed value is the value.** After validation the function uses the trimmed string of
+`META_APP_SECRET` and `META_VERIFY_TOKEN` everywhere: the HMAC key (§4) and the verify-token digest (§4) are
+computed from exactly the string the validity rule checked, never from the raw env value. The incoming
+`hub.verify_token` is not trimmed (it is compared as received). So a secret pasted with a trailing newline
+works, and the length floor can't be met by whitespace.
 
 The function reads them **on every request** (no caching across a config change). If any one is unset,
 empty or invalid, **every** request (GET and POST) gets `500` with an empty body. Nothing else happens: no
@@ -93,7 +101,7 @@ Read the query with `new URL(req.url).searchParams` (the dots in `hub.*` are lit
 
 - Header `X-Hub-Signature-256` must be present and of the form `sha256=` followed by exactly 64 hex digits.
   Missing, another prefix, wrong length or non-hex → `403`.
-- Expected value = HMAC-SHA256(key = `META_APP_SECRET` as UTF-8, message = the raw request bytes from step 3b).
+- Expected value = HMAC-SHA256(key = the **trimmed** `META_APP_SECRET` (§1) as UTF-8, message = the raw request bytes from step 3b).
   Never hash a re-serialized or re-encoded body: Meta escapes non-ASCII as `\uXXXX` in what it signs, so
   `JSON.stringify(JSON.parse(body))` does not reproduce the signed bytes.
 - Compare in **constant time**: `crypto.subtle.verify("HMAC", key, receivedBytes, rawBody)` with the 32 bytes
@@ -101,7 +109,7 @@ Read the query with `new URL(req.url).searchParams` (the dots in `hub.*` are lit
   from `@std/crypto`). Never `===` / `==` on strings, hex or base64.
 - Mismatch → `403`. Parsing (step 5) starts only after a match.
 
-**Verify-token compare** (§3): compute `SHA-256(UTF-8(hub.verify_token))` and `SHA-256(UTF-8(META_VERIFY_TOKEN))`
+**Verify-token compare** (§3): compute `SHA-256(UTF-8(hub.verify_token))` (as received) and `SHA-256(UTF-8(trimmed META_VERIFY_TOKEN))` (§1)
 — always 32 bytes each — and compare the digests with `timingSafeEqual`. There is **no** length check before
 it and no early return on a length difference: `timingSafeEqual` on raw values of different lengths throws or
 returns early, which leaks the token length.
@@ -141,26 +149,43 @@ the worker marks it `failed` with `unsupported_payload: <reason>` (schema.md §3
   (not a duplicate, not a placeholder), whatever happened to the other events and even if the response is
   `500`; a redelivery then dedupes those rows.
 
-**Insert errors.** The SQLSTATE is the `code` of the PostgREST error body when it is a five-character
-SQLSTATE (`PGRST…` codes are not SQLSTATEs). Each failed insert is classified:
+**Insert errors.** The SQLSTATE is the `code` of the PostgREST error body when it matches `^[0-9A-Z]{5}$`
+(`PGRST…` codes are not SQLSTATEs); its class is the first two characters. Each failed insert is classified:
 
 | Class | Errors | Outcome for that event |
 |---|---|---|
-| **Permanent** | SQLSTATE class `22` (data exception, e.g. `22P05`: jsonb rejects a `\u0000` escape in third-party caption text) or class `23` (integrity; `23505` on `message_mid` never surfaces, `on conflict` absorbs it) | log `insert_rejected: <SQLSTATE>`, store the **placeholder row** below, counts as handled |
-| **Transient** | everything else: network error, timeout, no response, PostgREST HTTP `5xx`, SQLSTATE classes `08`, `40`, `53`, `57` (and any other class, e.g. `42` after a bad migration), `PGRST…` / HTTP `401`/`403` from a wrong key | log `insert_failed: <SQLSTATE \| HTTP status \| exception class>`; the response is `500` so Meta redelivers |
+| **Permanent** | SQLSTATE class `22` (data exception, e.g. `22P05`: jsonb rejects a `\u0000` escape in third-party caption text; `22P02`: invalid json input), class `23` (integrity; `23505` on `message_mid` never surfaces, `on conflict` absorbs it), class `54` (program limit exceeded, e.g. `54000`: an index row too large for an oversized `mid`), or PostgREST code **`PGRST102`** (HTTP `400`, invalid request body) | log `insert_rejected: <SQLSTATE or PGRST102>`, store the **placeholder row** below, counts as handled |
+| **Transient** | everything else: network error, timeout, no response, PostgREST HTTP `5xx`, SQLSTATE classes `08`, `40`, `53`, `57` (and any other class, e.g. `42` after a bad migration), every other `PGRST…` code (including the rest of `PGRST1xx`, which a client or config bug produces for every request) / HTTP `401`/`403` from a wrong key | log `insert_failed: <SQLSTATE \| PGRST code \| HTTP status \| exception class>`; the response is `500` so Meta redelivers |
 
 Unknown errors default to **transient**: a redelivery after the cause is fixed stores the event, and dedupe
-makes the retry safe. Only the two classes above are known to fail the same way forever.
+makes the retry safe. Only the entries in the permanent row are known to fail the same way forever for the
+same input.
+
+**Lone surrogates.** A caption can carry a `\ud800` escape with no low surrogate. Step 5 accepts it (the
+bytes are valid ASCII and `JSON.parse` allows it), the receiver passes the event to the DB client unchanged,
+and the client's `JSON.stringify` sends it as `\ud800`. The expected outcome is SQLSTATE `22P02` from
+Postgres's jsonb input (class 22, permanent), unless PostgREST's own JSON parser rejects the body first
+(`PGRST102`, permanent too). Both are covered by the table; which one the pinned Supabase stack produces is
+fixed by the integration test in §10, so a platform upgrade that changes it fails that test instead of
+silently turning a permanent rejection into a 36 h retry loop.
+
+**Alerting** (devops-engineer, M0.6): the same `insert_failed: <code>` in 3 or more requests within 1 hour
+alerts the owner (a transient error that keeps repeating is probably permanent and is looping on Meta's
+retries), and so does the same `insert_rejected: <code>` in 3 or more log lines within 1 hour (one input
+being rejected is bad input; every share being rejected is a bug, e.g. a bad migration). The thresholds are
+defaults that devops may tune in `ops/`; the log codes above are the contract.
 
 **Placeholder row** (permanent rejection only). So the owner sees that a share failed instead of it vanishing,
 the receiver inserts, with the same `on conflict (message_mid) do nothing`:
 
 ```text
 message_mid = message.mid, sender_id = sender.id,
-raw_payload = {"insta_saver_placeholder": "insert_rejected", "sqlstate": "<SQLSTATE>"}
+raw_payload = {"insta_saver_placeholder": "insert_rejected", "sqlstate": "<SQLSTATE or unknown>"}
 ```
 
-`raw_payload` holds only this fixed marker, never any part of the event. The worker's `parse()` raises
+`sqlstate` is the SQLSTATE only if it matches `^[0-9A-Z]{5}$` (checked again right before the write);
+otherwise, including for `PGRST102`, it is the fixed string `"unknown"`. `raw_payload` holds only this fixed
+marker, never any part of the event. The worker's `parse()` raises
 `UnsupportedPayload("insert_rejected")` for it (interfaces.md §1), so the row ends `failed` with
 `unsupported_payload: insert_rejected` and shows up in the UI. A placeholder gets no background work (no media
 copy, no ack DM). If the placeholder insert itself fails, the same table applies: permanent → log
@@ -185,7 +210,8 @@ transient → `500`.
 
 Allowed in logs: the HTTP status and outcome code, `pathname` (never the full URL — the handshake query
 contains `hub.verify_token`), body byte length, counts per drop reason, number of rows inserted, inserted
-`posts.id` values, exception class names, SQLSTATE codes and the HTTP status of a failed DB call.
+`posts.id` values, exception class names, SQLSTATE codes, PostgREST `PGRST…` codes and the HTTP status of a
+failed DB call.
 
 Never logged: the raw or parsed body or any part of it (captions, CDN URLs, `mid`s, sender ids), request
 headers (`X-Hub-Signature-256`, `Authorization`, `apikey`), the query string, any env value or token, and
@@ -207,7 +233,8 @@ error-status test also asserts an **empty body**, and the whole suite asserts th
 
 | Rule | Test |
 |---|---|
-| Fail closed | each of the three variables unset / `""` / `"  "` → `GET` and `POST` both `500`, zero DB calls, zero fetches. `ALLOWED_SENDER_IDS` = `","`, `"abc"`, `"123,*"` → `500`. `META_VERIFY_TOKEN` of 31 characters → `500`; 32 → accepted |
+| Fail closed | each of the three variables unset / `""` / `"  "` → `GET` and `POST` both `500`, zero DB calls, zero fetches. `ALLOWED_SENDER_IDS` = `","`, `"abc"`, `"123,*"` → `500`. `META_VERIFY_TOKEN` of 31 characters → `500`; 32 → accepted; 31 characters plus a trailing space or newline → `500` |
+| Trimmed secrets | `META_APP_SECRET="<secret>\n"`: a signature computed with key `<secret>` → `200`, one computed with `"<secret>\n"` → `403`. `META_VERIFY_TOKEN="  <token>\n"`: handshake with `<token>` → `200`; with `"  <token>\n"` (URL-encoded) → `403` |
 | Platform env | `SUPABASE_URL` or `SUPABASE_SERVICE_ROLE_KEY` unset / `""` → `GET` and `POST` `500`, empty body, zero DB calls, zero fetches |
 | Config per request | one handler instance: request 1 with valid env → `200`; set `ALLOWED_SENDER_IDS=""` → request 2 → `500`; restore → request 3 → `200`. Same with a changed `ALLOWED_SENDER_IDS` value: request 2 uses the new list |
 | Method | `PUT`, `HEAD`, `OPTIONS` (with `Origin` and `Access-Control-Request-Method`) → `405`, empty body, no `Access-Control-Allow-Origin` |
@@ -221,8 +248,10 @@ error-status test also asserts an **empty body**, and the whole suite asserts th
 | Shape | event without `message.mid` (e.g. a reaction) → not inserted, `200` |
 | Body ignored | valid signature + invalid JSON, invalid UTF-8, or `object: "page"` → `200`, zero inserts |
 | Dedupe | insert returns no row → no background work scheduled, `200` |
-| Permanent rejection | batch of 3 accepted events, the 2nd insert fails with SQLSTATE `22P05` → `200`; events 1 and 3 inserted and get background work; a placeholder row for event 2 with `raw_payload` = exactly the marker; log has `insert_rejected: 22P05` and no DB error message. Same with a class `23` code. Placeholder insert also failing with `22P05` → `200`, log `placeholder_rejected: 22P05` |
-| Transient failure | batch of 3, the 2nd insert fails with each of: thrown network error, HTTP `503`, SQLSTATE `08006`, `40001`, `53300`, `57014`, `42P01`, `PGRST301` → `500`; events 1 **and 3** still inserted and get background work; no placeholder |
+| Permanent rejection | batch of 3 accepted events, the 2nd insert fails with SQLSTATE `22P05` → `200`; events 1 and 3 inserted and get background work; a placeholder row for event 2 with `raw_payload` = exactly the marker; log has `insert_rejected: 22P05` and no DB error message. Same with a class `23` code (`23502`), a class `54` code (`54000`) and `22P02`. HTTP `400` with code `PGRST102` → `200`, placeholder with `"sqlstate": "unknown"`, log `insert_rejected: PGRST102`. Placeholder insert also failing with `22P05` → `200`, log `placeholder_rejected: 22P05` |
+| Lone surrogate (unit) | a signed body whose caption text contains the escape `\ud800` (raw bytes) → passes step 5; the event handed to the fake DB client is unchanged (the caption string still holds U+D800). Fake returns `22P02` → placeholder, log `insert_rejected: 22P02`; fake returns HTTP `400` `PGRST102` → placeholder; fake returns HTTP `400` `PGRST100` → transient, `500`, no placeholder |
+| Lone surrogate (integration, test-engineer, `tests/integration/`, local `supabase start`, M1) | insert an event whose caption holds `\ud800` through the receiver's DB client against the pinned local stack; assert the **exact** observed outcome (expected `22P02`; or `PGRST102` if PostgREST rejects first) and that the receiver classifies it permanent and stores the placeholder. Record the observed code in the PR. If the stack stores the row instead (e.g. with U+FFFD), the test asserts that and no classification is needed. Same test with `\u0000` → expected `22P05` |
+| Transient failure | batch of 3, the 2nd insert fails with each of: thrown network error, HTTP `503`, SQLSTATE `08006`, `40001`, `53300`, `57014`, `42P01`, `PGRST301`, `PGRST100` → `500`; events 1 **and 3** still inserted and get background work; no placeholder |
 | Logging | capture all log output across the suite: it never contains the body, the signature value, `META_APP_SECRET`, `META_VERIFY_TOKEN`, a sender id, a `mid`, a query string or a DB error message |
 | Deploy config | parse `supabase/config.toml`: `[functions.ig-webhook] verify_jwt = false`, and no other function and no project-level setting has `verify_jwt = false` |
 | Post-upload write (M2) | the media write is the single conditional update from schema.md §3; zero rows updated → no throw, no retry |
