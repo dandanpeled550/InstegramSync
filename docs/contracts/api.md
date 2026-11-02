@@ -3,8 +3,9 @@
 - Version: v0.1 (M0.1b) · 2026-11-01 · owner: `architect` — v0.1: `OPTIONS` answered before Origin/CSRF,
   GET/HEAD side-effect rule, exact `API_DEV_ORIGIN` and Vite proxy rules ([ADR 0006](../decisions/0006-dev-proxy-preserves-host-origin.md)),
   rate-limit wording, `insta_saver_session` cookie, single session key, in-process `rerun_requested`
-  · round 2: Vite `cors: false`, `preview.*`, minimum Vite 6.0.9, `127.0.0.1` dev host, cookie residual risk,
-  async handlers for `rerun_requested`
+  · round 2: Vite `cors: false`, `preview.*`, `127.0.0.1` dev host, cookie residual risk, async handlers for
+  `rerun_requested` · round 3: Vite exact pin on a supported major maintained by Dependabot + `npm audit`
+  (replaces the 6.0.9 floor), tests for the background task's final step
 - Implemented by `web-engineer` (FastAPI, `backend/app/api/**`, served by `python -m app.serve` on
   `http://127.0.0.1:8000`, also reachable as `http://localhost:8000`); consumed by the Vite/React SPA served
   from the same origin. The network boundary (§1.1) and auth (§1.2) rules are normative.
@@ -93,9 +94,15 @@ contract change.
     `Access-Control-Allow-Origin` to proxied responses, breaking rule 3 in dev.
   - `vite preview` follows the same rules (`preview.host: "127.0.0.1"`, `preview.allowedHosts` never `true`,
     `preview.strictPort: true`, `preview.cors: false`), since preview reuses `server.proxy`.
-  - Minimum Vite version **6.0.9** (the release with the host check and the restricted CORS default,
-    CVE-2025-24010). web-engineer pins an exact version at or above it in `frontend/package.json` (via
-    devops-engineer).
+  - **Vite version:** an **exact pin** (no `^` / `~` range) in `frontend/package.json` to the latest patch of
+    a **currently supported major** that has no open GitHub security advisory at pin time (as of 2026-11-02
+    that means 7.3.7+ or 8.3.3+, per the PR #13 security review). These numbers are an example, not a floor: the
+    pin is **maintained by Dependabot** (devops-engineer adds the `npm` ecosystem for `frontend/` to
+    `.github/dependabot.yml`) and checked by `npm audit --audit-level=moderate` in CI, which fails on any
+    advisory against the pinned version. The restricted CORS default and host check this file relies on
+    arrived in 6.0.9 (CVE-2025-24010); later advisories (e.g. `server.fs.deny` bypasses, dev-server file read)
+    are why an old pin is not enough. web-engineer chooses the version; devops-engineer adds it after human
+    approval of the dependency.
 
 ### 1.2 Auth and session
 
@@ -146,7 +153,7 @@ is about it.
 |---|---|
 | Bind | settings validation refuses `API_HOST` = `0.0.0.0`, `::`, `192.168.1.10`; accepts `127.0.0.1` |
 | Dev origin parsing | `API_DEV_ORIGIN` = `http://192.168.1.10:5173`, `https://localhost:5173`, `http://localhost`, `http://localhost:5173/`, `http://localhost:5173/app`, `http://user@localhost:5173`, `http://localhost.evil.example:5173` → refused; `http://localhost:5173` and `http://127.0.0.1:5173` accepted |
-| Vite config | (here or as a frontend test) parse `frontend/vite.config.*` (static read or by importing the config object): `server.host` and `preview.host` = `"127.0.0.1"`, `server.cors` and `preview.cors` = `false`, `strictPort: true` on both, no `allowedHosts: true`, no `changeOrigin: true` and no header-rewriting hook on the `/api` proxy; the pinned `vite` version in `frontend/package.json` is ≥ 6.0.9 |
+| Vite config | (here or as a frontend test) parse `frontend/vite.config.*` (static read or by importing the config object): `server.host` and `preview.host` = `"127.0.0.1"`, `server.cors` and `preview.cors` = `false`, `strictPort: true` on both, no `allowedHosts: true`, no `changeOrigin: true` and no header-rewriting hook on the `/api` proxy; the `vite` entry in `frontend/package.json` is an exact version (matches `^[0-9]+\.[0-9]+\.[0-9]+$`, no range); CI's `npm audit --audit-level=moderate` for `frontend/` passes (devops, not this test) |
 | Dev origin exact match | with `API_DEV_ORIGIN=http://localhost:5173`: `Origin: http://localhost:5173` + `Host: localhost:5173` pass; `Origin: http://localhost:51730` → `403`; `Host: localhost:51730` → `421`; `Origin: http://localhost:5173.evil.example` → `403` |
 | Fail closed | auth on + `APP_PASSWORD` empty / 11 chars → refuses; `SESSION_SECRET` 31 bytes → refuses; `AUTH_ENABLED` unset, `"False"`, `"0"`, `"no"` → auth on |
 | Host | `Host: evil.example:8000`, `Host: 127.0.0.1:9999`, missing Host → `421` on `GET /api/posts` and `GET /`; both allowed hosts pass |
@@ -303,8 +310,12 @@ Re-run the cascade. No body.
   `async def`, and both read-and-update steps run on the event loop (`run_worker()` itself may run in a
   threadpool; the final step runs after it returns, back on the loop). If either step ever has to run in
   another thread (a sync `def` handler, or the final step inside the threadpool), both steps take one
-  shared `threading.Lock` instead. Test: the retry and process handlers are coroutine functions
-  (`inspect.iscoroutinefunction`).
+  shared `threading.Lock` instead. Tests: (1) the retry and process handlers **and** the background task
+  callable are coroutine functions (`inspect.iscoroutinefunction`); (2) with a fake `run_worker()` run in
+  the threadpool that blocks on an event, the task's final step records `threading.get_ident()` equal to the
+  event-loop thread's id; (3) a retry while the fake is blocked sets `rerun_requested`; releasing it gives
+  exactly one more run and then `running = false`; (4) the fake raising still runs the final step (one more
+  run if the flag was set, else `running = false`).
 - `202` + the updated Post object (`status: "received"`).
 - Media of `done`/`needs_review` posts is already deleted (or being deleted — an empty prefix counts as no
   media, storage.md §4), so their retry reuses stored vision evidence (interfaces.md §6); `failed` posts keep

@@ -26,8 +26,11 @@
    to `::1`), its host check stays on (`server.allowedHosts` is never `true`), and `server.cors: false`
    (Vite's default CORS middleware runs before the proxy and admits any local origin on any port). `vite
    preview` gets the same rules (`preview.host`, `preview.allowedHosts`, `preview.strictPort`,
-   `preview.cors: false`), because it reuses `server.proxy`. Minimum Vite version 6.0.9 (host check and
-   restricted CORS default, CVE-2025-24010). This is defence in depth, not the main control.
+   `preview.cors: false`), because it reuses `server.proxy`. Vite is pinned to an exact version: the latest
+   patch of a currently supported major with no open security advisory at pin time, kept current by
+   Dependabot and checked by `npm audit` in CI (api.md §1.1). No fixed version is recorded here as a floor:
+   the host check and restricted CORS default date from 6.0.9 (CVE-2025-24010), but later advisories make
+   any fixed floor stale. This is defence in depth, not the main control.
 3. `API_DEV_ORIGIN` is exactly `http://<localhost|127.0.0.1>:<port>`: explicit port, no path (not even `/`),
    query, fragment or userinfo. Anything else → `serve.py` refuses to start. The origin and its
    `<host>:<port>` are compared with the request's `Origin` and `Host` as **whole strings**, never as
