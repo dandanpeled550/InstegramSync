@@ -2,7 +2,8 @@
 
 - Status: accepted
 - Date: 2026-11-01
-- Deciders: architect (security review R2-2 on PR #4)
+- Deciders: product owner (the human; accepts it by approving PR #13, as for every ADR in a contract PR);
+  architect (security review R2-2 on PR #4 and SF3 on PR #13)
 - Supersedes: the dev-server parts of [ADR 0004](0004-local-api-network-boundary.md), namely decision 7 and
   the "or a proxy that rewrites `Host`/`Origin`" option under Consequences. The rest of ADR 0004 stands.
 
@@ -21,8 +22,12 @@
 ## Decision
 1. The only supported dev setup is `API_DEV_ORIGIN` plus a Vite proxy that **keeps** the browser's `Host` and
    `Origin`: `changeOrigin: false` (Vite's default) and no header rewriting. The API checks them as usual.
-2. Vite's `server.host` stays a loopback address (never `true` / `0.0.0.0`), and its host check stays on
-   (`server.allowedHosts` is never `true`). This is defence in depth, not the main control.
+2. Vite's `server.host` is `"127.0.0.1"` (never `true` / `0.0.0.0`, and not `localhost`, which may resolve
+   to `::1`), its host check stays on (`server.allowedHosts` is never `true`), and `server.cors: false`
+   (Vite's default CORS middleware runs before the proxy and admits any local origin on any port). `vite
+   preview` gets the same rules (`preview.host`, `preview.allowedHosts`, `preview.strictPort`,
+   `preview.cors: false`), because it reuses `server.proxy`. Minimum Vite version 6.0.9 (host check and
+   restricted CORS default, CVE-2025-24010). This is defence in depth, not the main control.
 3. `API_DEV_ORIGIN` is exactly `http://<localhost|127.0.0.1>:<port>`: explicit port, no path (not even `/`),
    query, fragment or userinfo. Anything else → `serve.py` refuses to start. The origin and its
    `<host>:<port>` are compared with the request's `Origin` and `Host` as **whole strings**, never as
@@ -41,6 +46,7 @@ Normative text and tests: [api.md §1.1, §1.3](../contracts/api.md#11-network-b
 - Easier: the API's checks stay the single source of truth in dev too; misconfiguration fails at startup.
 - Harder: the dev URL must match `API_DEV_ORIGIN` exactly (use `strictPort` so Vite doesn't drift to
   another port, otherwise requests get `421`/`403`).
-- Contracts: `api.md` §1.1 (dev server rules), §1.3 (two new test rows).
+- Contracts: `api.md` §1.1 (dev server rules), §1.3 (three new test rows: origin parsing, exact match, Vite
+  config).
 - Agents: web-engineer (`serve.py` settings validation, middleware, `frontend/vite.config.*`, tests),
   devops-engineer (`.env.example` comment for `API_DEV_ORIGIN`), security-reviewer.
