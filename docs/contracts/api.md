@@ -3,6 +3,8 @@
 - Version: v0.1 (M0.1b) · 2026-11-01 · owner: `architect` — v0.1: `OPTIONS` answered before Origin/CSRF,
   GET/HEAD side-effect rule, exact `API_DEV_ORIGIN` and Vite proxy rules ([ADR 0006](../decisions/0006-dev-proxy-preserves-host-origin.md)),
   rate-limit wording, `insta_saver_session` cookie, single session key, in-process `rerun_requested`
+  · round 2: Vite `cors: false`, `preview.*`, minimum Vite 6.0.9, `127.0.0.1` dev host, cookie residual risk,
+  async handlers for `rerun_requested`
 - Implemented by `web-engineer` (FastAPI, `backend/app/api/**`, served by `python -m app.serve` on
   `http://127.0.0.1:8000`, also reachable as `http://localhost:8000`); consumed by the Vite/React SPA served
   from the same origin. The network boundary (§1.1) and auth (§1.2) rules are normative.
@@ -80,10 +82,20 @@ contract change.
   Both are compared as **whole strings** — never prefix, suffix or substring matches (`http://localhost:5173`
   does not admit `http://localhost:51730`).
 - The Vite proxy keeps the browser's `Host` and `Origin` (`changeOrigin: false`, Vite's default, and no
-  header rewriting), so the API's own checks still see a rebound hostname. Vite's `server.host` stays a
-  loopback address (never `true` or `0.0.0.0`), and its host check stays on (`server.allowedHosts` is never
-  `true`). `server.strictPort: true`, so Vite never drifts to a port that doesn't match `API_DEV_ORIGIN`.
-  These are web-engineer's rules for `frontend/vite.config.*` ([ADR 0006](../decisions/0006-dev-proxy-preserves-host-origin.md)).
+  header rewriting), so the API's own checks still see a rebound hostname. Rules for `frontend/vite.config.*`
+  (web-engineer, [ADR 0006](../decisions/0006-dev-proxy-preserves-host-origin.md)):
+  - `server.host: "127.0.0.1"` (never `true`, `0.0.0.0` or `localhost`, which may resolve to `::1` — same
+    reason as rule 1). The documented dev setup is `API_DEV_ORIGIN=http://127.0.0.1:5173`.
+  - `server.allowedHosts` is never `true` (Vite's host check stays on).
+  - `server.strictPort: true`, so Vite never drifts to a port that doesn't match `API_DEV_ORIGIN`.
+  - `server.cors: false`. Vite's default CORS middleware runs before the proxy and admits any
+    `localhost` / `127.0.0.1` origin on any port; with it on, Vite answers `/api` preflights itself and adds
+    `Access-Control-Allow-Origin` to proxied responses, breaking rule 3 in dev.
+  - `vite preview` follows the same rules (`preview.host: "127.0.0.1"`, `preview.allowedHosts` never `true`,
+    `preview.strictPort: true`, `preview.cors: false`), since preview reuses `server.proxy`.
+  - Minimum Vite version **6.0.9** (the release with the host check and the restricted CORS default,
+    CVE-2025-24010). web-engineer pins an exact version at or above it in `frontend/package.json` (via
+    devops-engineer).
 
 ### 1.2 Auth and session
 
@@ -103,6 +115,11 @@ contract change.
   either one invalidates every session. Pass itsdangerous that single key, **never a list**: a list means
   rotation keys, any one of them verifies, and a password change would not log anyone out. Stateless; no
   server-side session table.
+- **Accepted residual risk — cookies are not port-scoped.** The browser sends `insta_saver_session` to every
+  server on `127.0.0.1` / `localhost`, whatever the port. Another local server the owner runs could read (and
+  replay) it. The unique name only prevents accidental overwrites. Accepted for v0: the threat model is a
+  single-user laptop, where a malicious local process already has more direct access (the `.env` with
+  `DATABASE_URL`). A hosted mode (PLAN §8) must revisit this (e.g. `__Host-` prefix over HTTPS).
 - **Kill switch / logout:** rotating `SESSION_SECRET` (and restarting the server) revokes every session.
 - **Login** compares `hmac.compare_digest(given.encode("utf-8"), APP_PASSWORD.encode("utf-8"))` — non-ASCII
   input is a normal wrong password (`401`), never a `500`.
@@ -129,6 +146,7 @@ is about it.
 |---|---|
 | Bind | settings validation refuses `API_HOST` = `0.0.0.0`, `::`, `192.168.1.10`; accepts `127.0.0.1` |
 | Dev origin parsing | `API_DEV_ORIGIN` = `http://192.168.1.10:5173`, `https://localhost:5173`, `http://localhost`, `http://localhost:5173/`, `http://localhost:5173/app`, `http://user@localhost:5173`, `http://localhost.evil.example:5173` → refused; `http://localhost:5173` and `http://127.0.0.1:5173` accepted |
+| Vite config | (here or as a frontend test) parse `frontend/vite.config.*` (static read or by importing the config object): `server.host` and `preview.host` = `"127.0.0.1"`, `server.cors` and `preview.cors` = `false`, `strictPort: true` on both, no `allowedHosts: true`, no `changeOrigin: true` and no header-rewriting hook on the `/api` proxy; the pinned `vite` version in `frontend/package.json` is ≥ 6.0.9 |
 | Dev origin exact match | with `API_DEV_ORIGIN=http://localhost:5173`: `Origin: http://localhost:5173` + `Host: localhost:5173` pass; `Origin: http://localhost:51730` → `403`; `Host: localhost:51730` → `421`; `Origin: http://localhost:5173.evil.example` → `403` |
 | Fail closed | auth on + `APP_PASSWORD` empty / 11 chars → refuses; `SESSION_SECRET` 31 bytes → refuses; `AUTH_ENABLED` unset, `"False"`, `"0"`, `"no"` → auth on |
 | Host | `Host: evil.example:8000`, `Host: 127.0.0.1:9999`, missing Host → `421` on `GET /api/posts` and `GET /`; both allowed hosts pass |
@@ -281,6 +299,12 @@ Re-run the cascade. No body.
   background task's final "if `rerun_requested` then clear it and loop, else set `running = false`". So a
   retry cannot fall into a gap between the last check and `running = false`. If `run_worker()` raises, the
   task logs it and then does the same final step (a set flag still causes exactly one more run).
+  "No `await` in between" is atomic only on the event-loop thread. So the `retry` and `process` handlers are
+  `async def`, and both read-and-update steps run on the event loop (`run_worker()` itself may run in a
+  threadpool; the final step runs after it returns, back on the loop). If either step ever has to run in
+  another thread (a sync `def` handler, or the final step inside the threadpool), both steps take one
+  shared `threading.Lock` instead. Test: the retry and process handlers are coroutine functions
+  (`inspect.iscoroutinefunction`).
 - `202` + the updated Post object (`status: "received"`).
 - Media of `done`/`needs_review` posts is already deleted (or being deleted — an empty prefix counts as no
   media, storage.md §4), so their retry reuses stored vision evidence (interfaces.md §6); `failed` posts keep
