@@ -52,4 +52,27 @@ or `security-gate.yml` gets `security-reviewer` and a human flag.
 
 ## Local setup
 
-Added in M0 by `devops-engineer` — see the `Makefile` and `.env.example` once they exist.
+See the `Makefile` (`make help`) and `.env.example`.
+
+### Local Supabase exposes ports on all interfaces
+
+The local Supabase stack (CLI 2.122.0) publishes its ports on all network interfaces, not just localhost:
+54321 (API), 54322 (Postgres), 54323 (Studio, no login) and 54324 (Mailpit). The local demo keys are well
+known, so anyone on the same network could reach your local database. On Docker Desktop for Mac the
+listener is Docker Desktop's own proxy (`com.docker.backend`), so neither Docker's `"ip"` setting nor
+network options change it (verified 2026-11-02, Docker Desktop 4.54.0).
+
+What to do instead:
+
+- Run the stack only on trusted networks, and run `supabase stop` when you are done.
+- Keep only synthetic data in the local database.
+- Optional, untested: block incoming connections for Docker in the macOS firewall (System Settings,
+  Network, Firewall, Options).
+
+See what is actually exposed:
+
+```sh
+lsof -nP -iTCP -sTCP:LISTEN | grep -E ':5432[0-9]'   # "*:5432x" means all interfaces
+```
+
+On Linux use `sudo lsof -nP -iTCP -sTCP:LISTEN` or `ss -ltn`.

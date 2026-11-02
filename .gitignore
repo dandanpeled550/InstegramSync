@@ -51,3 +51,6 @@ supabase/.branches/
 .idea/
 .vscode/*
 !.vscode/extensions.json
+
+# Supabase CLI local JWT signing keys
+supabase/signing_keys.json
